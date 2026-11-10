@@ -1,0 +1,12 @@
+/builds/
+/target/
+.cargo/
+.idea/
+.vscode/
+*.pdb
+*.obj
+*.lib
+*.exp
+*.ilk
+*.log
+*.pyc
