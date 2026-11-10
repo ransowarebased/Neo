@@ -4,9 +4,9 @@ use neo::protocol::memory::{
 };
 use neo::protocol::{
     MATRIXHV_EXIT_TIMING_CAPABILITY, MATRIXHV_EXIT_TIMING_SUBLEAF, MATRIXHV_STATUS_LEAF,
-    MATRIXHV_STATUS_SIGNATURE_EAX, MATRIXHV_STATUS_SIGNATURE_EBX, MATRIXHV_STATUS_SIGNATURE_ECX,
-    MATRIXHV_VMCALL_SNAPSHOT_CAPABILITY, MATRIXHV_VMCALL_SNAPSHOT_SUBLEAF,
-    MATRIXHV_VMCALL_SNAPSHOT_WORDS,
+    MATRIXHV_STATUS_PROTOCOL, MATRIXHV_STATUS_SIGNATURE_EAX, MATRIXHV_STATUS_SIGNATURE_EBX,
+    MATRIXHV_STATUS_SIGNATURE_ECX, MATRIXHV_VMCALL_SNAPSHOT_CAPABILITY,
+    MATRIXHV_VMCALL_SNAPSHOT_SUBLEAF, MATRIXHV_VMCALL_SNAPSHOT_WORDS,
 };
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -14,7 +14,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MATRIXHV_DIAGNOSTIC_MIN_PROTOCOL: u32 = 4;
-const MATRIXHV_DIAGNOSTIC_PROTOCOL: u32 = 8;
 const TELEMETRY_CONTROL_CAPABILITY: u32 = 1 << 8;
 const EXIT_PROFILE_CAPABILITY: u32 = 1 << 10;
 const EXIT_REASON_COUNTS_CAPABILITY: u32 = 1 << 11;
@@ -1195,7 +1194,7 @@ fn verify_cpu(cpu: u32) -> Result<(), String> {
     {
         return Err(format!("MatrixHV is not present on logical CPU {cpu}"));
     }
-    if !(MATRIXHV_DIAGNOSTIC_MIN_PROTOCOL..=MATRIXHV_DIAGNOSTIC_PROTOCOL).contains(&status.edx) {
+    if !(MATRIXHV_DIAGNOSTIC_MIN_PROTOCOL..=MATRIXHV_STATUS_PROTOCOL).contains(&status.edx) {
         return Err(format!(
             "unsupported MatrixHV diagnostic protocol {} on logical CPU {cpu}",
             status.edx
@@ -1715,7 +1714,7 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
         any(target_os = "windows", target_os = "linux")
     ))]
     if matrixhv_present
-        && (MATRIXHV_DIAGNOSTIC_MIN_PROTOCOL..=MATRIXHV_DIAGNOSTIC_PROTOCOL).contains(&protocol)
+        && (MATRIXHV_DIAGNOSTIC_MIN_PROTOCOL..=MATRIXHV_STATUS_PROTOCOL).contains(&protocol)
     {
         let caps = diagnostic(34);
         let low = diagnostic(1);

@@ -6,14 +6,12 @@ A running MatrixHV core that advertises status protocol 9 is required (`MATRIXHV
 
 ## Dependencies
 
-Neo depends on the MatrixHV API crates from the `refactor/hypervisor-api` branch:
+Neo pins both MatrixHV API crates to a validated revision of MatrixHV:
 
 ```toml
-matrixhv-client = { git = "https://github.com/ransowarebased/MatrixHV", branch = "refactor/hypervisor-api" }
-matrixhv-protocol = { git = "https://github.com/ransowarebased/MatrixHV", branch = "refactor/hypervisor-api" }
+matrixhv-client = { git = "https://github.com/ransowarebased/MatrixHV", rev = "50292addaf4347a6eae58e1f594e4bbeeb978798" }
+matrixhv-protocol = { git = "https://github.com/ransowarebased/MatrixHV", rev = "50292addaf4347a6eae58e1f594e4bbeeb978798" }
 ```
-
-Once the MatrixHV pull request that publishes this API merges, switch the branch pin to `main` or a release tag.
 
 ## Build
 

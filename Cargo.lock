@@ -388,7 +388,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "matrixhv-client"
 version = "1.0.0"
-source = "git+https://github.com/ransowarebased/MatrixHV?branch=refactor%2Fhypervisor-api#d143db17816a248a283121f8e61b97467be57f52"
+source = "git+https://github.com/ransowarebased/MatrixHV?rev=50292addaf4347a6eae58e1f594e4bbeeb978798#50292addaf4347a6eae58e1f594e4bbeeb978798"
 dependencies = [
  "matrixhv-protocol",
 ]
@@ -396,7 +396,7 @@ dependencies = [
 [[package]]
 name = "matrixhv-protocol"
 version = "1.0.0"
-source = "git+https://github.com/ransowarebased/MatrixHV?branch=refactor%2Fhypervisor-api#d143db17816a248a283121f8e61b97467be57f52"
+source = "git+https://github.com/ransowarebased/MatrixHV?rev=50292addaf4347a6eae58e1f594e4bbeeb978798#50292addaf4347a6eae58e1f594e4bbeeb978798"
 
 [[package]]
 name = "memchr"
