@@ -1,4 +1,4 @@
-pub use matrixhv_client::memory::*;
+pub use matrixhv_sdk::memory::*;
 
 use crate::protocol::memory::{HEADER_BYTES, ITEM_BYTES, READ, WRITE};
 use crate::symbols::{KernelSymbols, Process};

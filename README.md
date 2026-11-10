@@ -2,15 +2,14 @@
 
 Neo is the host-side CLI, TCP control server, and telemetry agent for the [MatrixHV](https://github.com/ransowarebased/MatrixHV) hypervisor. It is a client of the MatrixHV host API, not part of the UEFI core.
 
-A running MatrixHV core that advertises status protocol 9 is required (`MATRIXHV_STATUS_PROTOCOL = 9` in `matrixhv-protocol`). Older cores are not supported.
+A running MatrixHV core that advertises status protocol 9 is required (`MATRIXHV_STATUS_PROTOCOL = 9` in `matrixhv_sdk::protocol`). Older cores are not supported.
 
 ## Dependencies
 
-Neo pins both MatrixHV API crates to a validated revision of MatrixHV:
+Neo pins the Rust SDK to a validated MatrixHV revision.
 
 ```toml
-matrixhv-client = { git = "https://github.com/ransowarebased/MatrixHV", rev = "50292addaf4347a6eae58e1f594e4bbeeb978798" }
-matrixhv-protocol = { git = "https://github.com/ransowarebased/MatrixHV", rev = "50292addaf4347a6eae58e1f594e4bbeeb978798" }
+matrixhv-sdk = { git = "https://github.com/ransowarebased/MatrixHV", rev = "2fdb151f00712f8c26c444510cd2dadde4893369" }
 ```
 
 ## Build

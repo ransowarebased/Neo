@@ -32,8 +32,7 @@ name = "analysis"
 path = "tests/neo_analysis_tests.rs"
 
 [dependencies]
-matrixhv-protocol = { git = "https://github.com/ransowarebased/MatrixHV", rev = "50292addaf4347a6eae58e1f594e4bbeeb978798" }
-matrixhv-client = { git = "https://github.com/ransowarebased/MatrixHV", rev = "50292addaf4347a6eae58e1f594e4bbeeb978798" }
+matrixhv-sdk = { git = "https://github.com/ransowarebased/MatrixHV", rev = "2fdb151f00712f8c26c444510cd2dadde4893369" }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 pdb = "0.8.0"

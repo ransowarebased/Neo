@@ -386,17 +386,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
-name = "matrixhv-client"
+name = "matrixhv-sdk"
 version = "1.0.0"
-source = "git+https://github.com/ransowarebased/MatrixHV?rev=50292addaf4347a6eae58e1f594e4bbeeb978798#50292addaf4347a6eae58e1f594e4bbeeb978798"
-dependencies = [
- "matrixhv-protocol",
-]
-
-[[package]]
-name = "matrixhv-protocol"
-version = "1.0.0"
-source = "git+https://github.com/ransowarebased/MatrixHV?rev=50292addaf4347a6eae58e1f594e4bbeeb978798#50292addaf4347a6eae58e1f594e4bbeeb978798"
+source = "git+https://github.com/ransowarebased/MatrixHV?rev=2fdb151f00712f8c26c444510cd2dadde4893369#2fdb151f00712f8c26c444510cd2dadde4893369"
 
 [[package]]
 name = "memchr"
@@ -421,8 +413,7 @@ dependencies = [
  "colored",
  "ed25519-dalek",
  "libc",
- "matrixhv-client",
- "matrixhv-protocol",
+ "matrixhv-sdk",
  "pdb",
  "serde",
  "serde_json",
