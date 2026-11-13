@@ -371,8 +371,10 @@ fn unicode_string(
     let bytes = read_exact(reader, pointer, length)?;
     String::from_utf16(
         &bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect::<Vec<_>>(),
     )
     .map_err(|_| "invalid loader UTF-16 string".into())

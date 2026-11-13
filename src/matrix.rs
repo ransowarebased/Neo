@@ -10,12 +10,12 @@ pub enum Command {
 #[cfg(target_os = "windows")]
 pub(crate) mod windows {
     use super::Command;
+    use crate::server::protocol::{RequestKind, Response, read_response, write_response};
+    use crate::update::{self, Abi, Package, Phase};
     use neo::protocol::{
         CONTROL_MAGIC, CONTROL_PROBE_OPERATION, CONTROL_VERSION, ControlProbeSnapshot,
         ControlRequest, ControlStatus,
     };
-    use crate::server::protocol::{RequestKind, Response, read_response, write_response};
-    use crate::update::{self, Abi, Package, Phase};
     use std::ffi::c_void;
     use std::io::{Read, Write};
     use std::mem::size_of;
@@ -1037,16 +1037,24 @@ pub(crate) mod windows {
             nested_bytes: reference.update_abi[3],
             cpu_bytes: reference.update_abi[4],
         };
-        if reference.update_abi[5] != update::STATE_ABI {
-            return Err("unsupported resident state ABI".into());
+        if !update::supports_state_abi(reference.update_abi[5]) {
+            return Err(format!(
+                "unsupported resident state ABI {}",
+                reference.update_abi[5]
+            ));
         }
-        let package =
-            Package::parse(&bytes, abi, &reference.update_public_key).map_err(|error| {
-                format!(
-                    "resident package rejected before off: {}",
-                    update::Error::description(error as u32)
-                )
-            })?;
+        let package = Package::parse_for_state(
+            &bytes,
+            abi,
+            &reference.update_public_key,
+            reference.update_abi[5],
+        )
+        .map_err(|error| {
+            format!(
+                "resident package rejected before off: {}",
+                update::Error::description(error as u32)
+            )
+        })?;
         let previous = update_status(reference);
         let current_version = if previous.phase == Phase::Complete as u32 {
             previous.next_version

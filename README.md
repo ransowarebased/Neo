@@ -9,7 +9,7 @@ A running MatrixHV core that advertises status protocol 9 is required (`MATRIXHV
 Neo pins the Rust SDK to a validated MatrixHV revision.
 
 ```toml
-matrixhv-sdk = { git = "https://github.com/ransowarebased/MatrixHV", rev = "2fdb151f00712f8c26c444510cd2dadde4893369" }
+matrixhv-sdk = { git = "https://github.com/ransowarebased/MatrixHV", rev = "711d62ded04b24181c8147349e9e631c11a32fe2" }
 ```
 
 ## Build

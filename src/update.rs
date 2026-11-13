@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 pub const PACKAGE_MAGIC: &[u8; 8] = b"MATRIXUP";
 pub const PACKAGE_VERSION: u32 = 1;
 pub const STATE_ABI: u32 = 1;
+pub const STATE_ABI_DATA_SHADOW: u32 = 2;
 pub const HEADER_BYTES: usize = 256;
 pub const BANK_BYTES: usize = 256 * 1024;
 pub const BANK_PAGES: usize = BANK_BYTES / 4096;
@@ -26,6 +27,10 @@ pub const CANCEL: u32 = 12;
 pub const RECOVER: u32 = 13;
 pub const RECOVERED: u32 = 14;
 pub const QUERY: u32 = 15;
+
+pub const fn supports_state_abi(state_abi: u32) -> bool {
+    matches!(state_abi, STATE_ABI | STATE_ABI_DATA_SHADOW)
+}
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,6 +198,15 @@ pub struct Package<'a> {
 
 impl<'a> Package<'a> {
     pub fn parse(bytes: &'a [u8], abi: Abi, public_key: &[u8; 32]) -> Result<Self, Error> {
+        Self::parse_for_state(bytes, abi, public_key, STATE_ABI)
+    }
+
+    pub fn parse_for_state(
+        bytes: &'a [u8],
+        abi: Abi,
+        public_key: &[u8; 32],
+        state_abi: u32,
+    ) -> Result<Self, Error> {
         let identity = package_identity(bytes)?;
         if &bytes[..8] != PACKAGE_MAGIC
             || word(bytes, 8)? != PACKAGE_VERSION
@@ -202,7 +216,8 @@ impl<'a> Package<'a> {
         {
             return Err(Error::Format);
         }
-        if word(bytes, 28)? != STATE_ABI
+        if !supports_state_abi(state_abi)
+            || word(bytes, 28)? != state_abi
             || word(bytes, 40)? != abi.bridge
             || word(bytes, 80)? != abi.boot_bytes
             || word(bytes, 84)? != abi.event_bytes
@@ -248,8 +263,8 @@ impl<'a> Package<'a> {
             let flags = word(bytes, offset + 8)?;
             if start != covered
                 || length == 0
-                || start % 4096 != 0
-                || (index + 1 != region_count && length % 4096 != 0)
+                || !start.is_multiple_of(4096)
+                || (index + 1 != region_count && !length.is_multiple_of(4096))
                 || !matches!(flags, 3 | 5)
                 || word(bytes, offset + 12)? != 0
                 || start
@@ -286,7 +301,7 @@ impl<'a> Package<'a> {
             let addend = quad(bytes, offset + 8)?;
             let width = if kind == 7 { 32 } else { 8 };
             if !(1..=7).contains(&kind)
-                || target % 8 != 0
+                || !target.is_multiple_of(8)
                 || target < previous_end
                 || target
                     .checked_add(width)
@@ -351,10 +366,10 @@ impl<'a> Package<'a> {
                 word(self.bytes, offset),
                 word(self.bytes, offset + 4),
                 word(self.bytes, offset + 8),
-            ) {
-                if address >= start as usize && address < (start + length) as usize {
-                    return if flags == 5 { 1 } else { 3 | (1 << 63) };
-                }
+            ) && address >= start as usize
+                && address < (start + length) as usize
+            {
+                return if flags == 5 { 1 } else { 3 | (1 << 63) };
             }
         }
         3 | (1 << 63)
@@ -446,7 +461,7 @@ impl Upload {
             return Err(Error::Transaction);
         }
         if offset >= self.total_bytes
-            || offset % CHUNK_BYTES != 0
+            || !offset.is_multiple_of(CHUNK_BYTES)
             || payload.len() != CHUNK_BYTES.min(self.total_bytes - offset)
             || offset
                 .checked_add(payload.len())
@@ -793,7 +808,7 @@ impl<'a> EmbeddedImage<'a> {
                 .checked_add(length)
                 .filter(|end| *end <= bytes.len())
                 .ok_or(Error::Bounds)?;
-            if start % 4096 != 0
+            if !start.is_multiple_of(4096)
                 || length == 0
                 || start < previous_end
                 || flags & 0xa000_0000 == 0xa000_0000
@@ -815,10 +830,10 @@ impl<'a> EmbeddedImage<'a> {
         while cursor < self.relocations.end {
             let page = word(self.bytes, cursor)? as usize;
             let length = word(self.bytes, cursor + 4)? as usize;
-            if page % 4096 != 0
+            if !page.is_multiple_of(4096)
                 || previous_page.is_some_and(|previous| page <= previous)
                 || length < 8
-                || length % 2 != 0
+                || !length.is_multiple_of(2)
                 || cursor
                     .checked_add(length)
                     .is_none_or(|end| end > self.relocations.end)
@@ -886,12 +901,12 @@ impl<'a> EmbeddedImage<'a> {
                 word(self.bytes, offset + 12),
                 word(self.bytes, offset + 8),
                 word(self.bytes, offset + 36),
-            ) {
-                if address >= start as usize && address < start as usize + length as usize {
-                    return 1
-                        | if flags & 0x8000_0000 != 0 { 2 } else { 0 }
-                        | if flags & 0x2000_0000 == 0 { 1 << 63 } else { 0 };
-                }
+            ) && address >= start as usize
+                && address < start as usize + length as usize
+            {
+                return 1
+                    | if flags & 0x8000_0000 != 0 { 2 } else { 0 }
+                    | if flags & 0x2000_0000 == 0 { 1 << 63 } else { 0 };
             }
         }
         1 | (1 << 63)

@@ -22,12 +22,12 @@ mod repl {
 
     fn shell(arguments: &[&str], input: &str) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_neo"))
-        .args(arguments)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
         child
             .stdin
             .take()

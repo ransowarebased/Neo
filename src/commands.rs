@@ -1,6 +1,6 @@
 use crate::server::protocol::{
-    DEFAULT_EXEC_TIMEOUT_MS, ProtocolError, Request, RequestKind, Response,
-    read_response, write_request,
+    DEFAULT_EXEC_TIMEOUT_MS, ProtocolError, Request, RequestKind, Response, read_response,
+    write_request,
 };
 use crate::server::{self, DEFAULT_LISTEN_ADDRESS, ServerExit};
 use crate::{matrix, output, startup, telemetry};
@@ -540,7 +540,6 @@ fn print_execution(response: Response, self_command: bool) -> Result<i32, String
     }
     Ok(exit_code)
 }
-
 
 fn transact(remote: &str, timeout: Duration, request: Request) -> Result<Response, String> {
     let (mut stream, id) = send_request(remote, timeout, request)?;
@@ -1215,7 +1214,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(
-            matches!(dump.action, Action::IntelPt { output: Some(path), .. } if path == std::path::PathBuf::from("trace"))
+            matches!(dump.action, Action::IntelPt { output: Some(path), .. } if path == *"trace")
         );
         for arguments in [
             vec!["pt", "dump"],

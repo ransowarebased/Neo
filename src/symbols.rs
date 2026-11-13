@@ -460,19 +460,31 @@ pub struct Process {
     object: u64,
     pub pid: u64,
     pub name: String,
+    pub(crate) name_truncated: bool,
+    /// Raw directory-table value recorded in the Windows process object.
     pub kernel_cr3: u64,
+    /// Raw user directory-table value recorded in the Windows process object.
     pub user_cr3: u64,
     pub peb: u64,
     pub wow64: bool,
+    pub(crate) validated_user_cr3: Option<u64>,
+    pub(crate) kernel_access_cr3: u64,
+    pub(crate) observed_kernel_cr3: u64,
 }
 
 impl Process {
     pub fn user_root(&self) -> u64 {
-        if self.user_cr3 != 0 {
+        if let Some(root) = self.validated_user_cr3 {
+            root
+        } else if self.user_cr3 != 0 {
             self.user_cr3
         } else {
             self.kernel_cr3
         }
+    }
+
+    pub fn kernel_access_root(&self) -> u64 {
+        self.kernel_access_cr3
     }
 }
 
@@ -647,7 +659,7 @@ impl KernelSymbols {
             .checked_add(length as u64 - 1)
             .ok_or("VAD range overflow")?;
         let root = read_ranges(
-            process.kernel_cr3,
+            process.kernel_access_root(),
             &[(process.object + self.vad.root_offset as u64, 8)],
         )?;
         let mut node = quad(&root[0], 0)?;
@@ -662,7 +674,7 @@ impl KernelSymbols {
             let object = node
                 .checked_sub(self.vad.node_offset as u64)
                 .ok_or("VAD pointer underflow")?;
-            let rows = read_ranges(process.kernel_cr3, &[(object, self.vad.bytes)])?;
+            let rows = read_ranges(process.kernel_access_root(), &[(object, self.vad.bytes)])?;
             let row = &rows[0];
             let region = self.vad.region(row)?;
             if address < region.start {
@@ -685,7 +697,7 @@ impl KernelSymbols {
             .checked_add(self.vad.root_offset as u64)
             .ok_or("VAD root overflow")?;
         self.vad.regions(root_address, &mut |address, length| {
-            Ok(read_ranges(process.kernel_cr3, &[(address, length)])?.remove(0))
+            Ok(read_ranges(process.kernel_access_root(), &[(address, length)])?.remove(0))
         })
     }
 
@@ -765,6 +777,7 @@ impl KernelSymbols {
                     object: current,
                     pid,
                     name,
+                    name_truncated: end >= raw_name.len().saturating_sub(1),
                     kernel_cr3: directory,
                     user_cr3: user_directory,
                     peb: quad(row, self.peb_offset)?,
@@ -774,6 +787,9 @@ impl KernelSymbols {
                         .transpose()?
                         .unwrap_or(0)
                         != 0,
+                    validated_user_cr3: None,
+                    kernel_access_cr3: directory,
+                    observed_kernel_cr3: kernel_cr3,
                 });
                 if numeric.is_some() {
                     return matched.ok_or_else(|| "matched process is unavailable".into());

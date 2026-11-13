@@ -388,7 +388,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "matrixhv-sdk"
 version = "1.0.0"
-source = "git+https://github.com/ransowarebased/MatrixHV?rev=2fdb151f00712f8c26c444510cd2dadde4893369#2fdb151f00712f8c26c444510cd2dadde4893369"
+source = "git+https://github.com/ransowarebased/MatrixHV?rev=711d62ded04b24181c8147349e9e631c11a32fe2#711d62ded04b24181c8147349e9e631c11a32fe2"
 
 [[package]]
 name = "memchr"

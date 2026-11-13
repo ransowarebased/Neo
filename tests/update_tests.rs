@@ -106,6 +106,53 @@ fn authenticated_package_relocates_only_declared_data() {
 }
 
 #[test]
+fn preflight_accepts_only_matching_supported_resident_state_versions() {
+    for state_abi in [STATE_ABI, STATE_ABI_DATA_SHADOW] {
+        let (mut bytes, abi, key) = package(2);
+        bytes[28..32].copy_from_slice(&state_abi.to_le_bytes());
+        resign(&mut bytes);
+
+        assert!(supports_state_abi(state_abi));
+        assert!(Package::parse_for_state(&bytes, abi, &key, state_abi).is_ok());
+        let other = if state_abi == STATE_ABI {
+            STATE_ABI_DATA_SHADOW
+        } else {
+            STATE_ABI
+        };
+        assert_eq!(
+            Package::parse_for_state(&bytes, abi, &key, other).unwrap_err(),
+            Error::Abi
+        );
+        assert_eq!(
+            Package::parse_for_state(&bytes, abi, &key, 3).unwrap_err(),
+            Error::Abi
+        );
+        if state_abi == STATE_ABI {
+            assert!(Package::parse(&bytes, abi, &key).is_ok());
+        } else {
+            assert_eq!(Package::parse(&bytes, abi, &key).unwrap_err(), Error::Abi);
+        }
+
+        for offset in [40, 80, 84, 88, 92] {
+            let mut incompatible = bytes.clone();
+            let value = u32::from_le_bytes(incompatible[offset..offset + 4].try_into().unwrap());
+            incompatible[offset..offset + 4].copy_from_slice(&(value + 1).to_le_bytes());
+            resign(&mut incompatible);
+            assert_eq!(
+                Package::parse_for_state(&incompatible, abi, &key, state_abi).unwrap_err(),
+                Error::Abi
+            );
+        }
+        assert_eq!(
+            Package::parse_for_state(&bytes, abi, &[0; 32], state_abi).unwrap_err(),
+            Error::Signature
+        );
+    }
+    assert!(!supports_state_abi(0));
+    assert!(!supports_state_abi(3));
+}
+
+#[test]
 fn tampering_and_another_signer_are_rejected() {
     let (mut bytes, abi, key) = package(2);
     let last = bytes.len() - 1;

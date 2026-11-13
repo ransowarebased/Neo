@@ -1,6 +1,5 @@
 use neo::memory::{
-    CpuidGate, CpuidRecord, InterceptionRequest, decode_page_batch,
-    interception_packet,
+    CpuidGate, CpuidRecord, InterceptionRequest, decode_page_batch, interception_packet,
 };
 use neo::protocol::memory::*;
 use neo::unwind::{UnwindContext, unwind};
@@ -316,7 +315,12 @@ fn disassembly_labels_rip_relative_memory_and_calls_without_treating_constants_a
 fn pdata_unwinds_optimized_frames_without_rbp_and_handles_partial_prologs() {
     let (mut memory, module) = unwind_fixture(&[4, 0x42], 4, 0);
     put64(memory.regions.get_mut(&STACK).unwrap(), 40, BASE + 0x1200);
-    let result = unwind(&mut memory, &[module.clone()], context(0x1020), 8);
+    let result = unwind(
+        &mut memory,
+        std::slice::from_ref(&module),
+        context(0x1020),
+        8,
+    );
     assert!(result.complete, "{}", result.stop);
     assert_eq!(result.frames.len(), 2);
     assert_eq!(result.frames[0].method, "pdata");
@@ -344,7 +348,12 @@ fn epilog_simulation_uses_the_current_stack_instead_of_undoing_the_prolog_twice(
 fn unsupported_metadata_and_unmapped_stacks_return_partial_results() {
     let (mut memory, module) = unwind_fixture(&[4, 0x42], 4, 0);
     memory.regions.get_mut(&BASE).unwrap()[0x3100] = 3;
-    let result = unwind(&mut memory, &[module.clone()], context(0x1020), 8);
+    let result = unwind(
+        &mut memory,
+        std::slice::from_ref(&module),
+        context(0x1020),
+        8,
+    );
     assert!(!result.complete);
     assert_eq!(result.frames.len(), 1);
     assert!(result.stop.contains("version 3"));
@@ -365,7 +374,12 @@ fn chained_unwind_metadata_is_applied_and_cycles_are_reported() {
     put32(bytes, 0x310c, 0x3200);
     bytes[0x3200..0x3206].copy_from_slice(&[1, 4, 1, 0, 4, 0x42]);
     put64(memory.regions.get_mut(&STACK).unwrap(), 40, BASE + 0x1200);
-    let result = unwind(&mut memory, &[module.clone()], context(0x1020), 8);
+    let result = unwind(
+        &mut memory,
+        std::slice::from_ref(&module),
+        context(0x1020),
+        8,
+    );
     assert!(result.complete, "{}", result.stop);
     assert_eq!(result.frames[1].rsp, STACK + 48);
     put32(memory.regions.get_mut(&BASE).unwrap(), 0x310c, 0x3100);
@@ -450,7 +464,7 @@ fn dynamic_unwind_uses_captured_runtime_entries_outside_loaded_modules() {
     let result = neo::unwind::unwind_with_tables(
         &mut memory,
         &[],
-        &[table.clone()],
+        std::slice::from_ref(&table),
         context(0x1020),
         8,
         true,

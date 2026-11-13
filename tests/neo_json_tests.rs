@@ -170,8 +170,7 @@ fn error_codes_preserve_retry_and_committed_write_semantics() {
 fn telemetry_jsonl_files_keep_full_width_values_and_escaped_text() {
     let mut arguments = vec!["--json".into()];
     output::begin(&mut arguments);
-    let directory =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("builds/neo-json-tests");
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("builds/neo-json-tests");
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join(format!(
         "telemetry-{}-{}.jsonl",

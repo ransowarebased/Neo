@@ -1241,7 +1241,8 @@ impl CpuAffinity {
     fn registered_routes(&mut self, registered: u64) -> Result<Vec<(u32, u32)>, String> {
         // EFI MP slots and operating-system affinity indices are independent.
         // Query the pinned CPU before using its slot in captures or target selection.
-        registered_cpu_routes(&self.allowed().to_vec(), registered, |logical_cpu| {
+        let allowed = self.allowed().to_vec();
+        registered_cpu_routes(&allowed, registered, |logical_cpu| {
             self.pin(logical_cpu)?;
             verify_cpu(logical_cpu)?;
             Ok(diagnostic(34).ebx)

@@ -1,13 +1,13 @@
 use crate::output;
+use neo::memory::{
+    InterceptionRequest, Item, bitmap_packet, enumerate_targets, fetch_tracking_packet,
+    info_packet, resolve_process, start_tracking_packet, status_text, tracking_packet, transfer,
+};
 use neo::protocol::memory::{
     AD_CANCEL, AD_ENABLED, AD_LARGE_PAGE, AD_RELEASE, AD_STATUS, AD_STOP, BUFFER_BYTES,
     HEADER_BYTES, ITEM_BYTES, MAX_ITEMS, READ, ROOT_HISTORY_COUNT, TRACK_ACCESSED, TRACK_DIRTY,
     TRACK_DUMP_VALID, TRACK_FETCH_PAGES, TRACK_HASH_CHANGED, TRACK_MAX_PAGES, TRACK_RECORD_BYTES,
     TRACK_REMAPPED, WRITE, quad, word,
-};
-use neo::memory::{
-    InterceptionRequest, Item, bitmap_packet, enumerate_targets, fetch_tracking_packet,
-    info_packet, resolve_process, start_tracking_packet, status_text, tracking_packet, transfer,
 };
 use neo::symbols;
 use serde_json::{Value, json};
@@ -273,8 +273,8 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
 }
 
 pub(crate) fn cpuid_packet(arguments: &[String]) -> Result<Vec<u8>, String> {
-    use neo::protocol::memory::*;
     use neo::memory::{CpuidGate, CpuidRecord};
+    use neo::protocol::memory::*;
     let mut request = InterceptionRequest::default();
     match arguments.get(1).map(String::as_str) {
         Some("status") if arguments.len() == 2 => request.operation = INTERCEPT_STATUS,
@@ -378,7 +378,9 @@ pub(crate) fn run_observation(arguments: &[String]) -> Result<i32, String> {
     let mut bytes = neo::memory::interception_packet(&request)?;
     invoke(&mut bytes)?;
     if output::is_json() {
-        output::success(json!({"token": output::hex(quad(&bytes, 80)), "state": word(&bytes, 112)}))?;
+        output::success(
+            json!({"token": output::hex(quad(&bytes, 80)), "state": word(&bytes, 112)}),
+        )?;
     } else {
         println!("token={} state={}", quad(&bytes, 80), word(&bytes, 112));
     }
@@ -598,27 +600,18 @@ fn start_tracking(arguments: &[String]) -> Result<i32, String> {
         ));
     }
     let (kernel_root, user_root) = if let Some(pid) = pid {
-        let mut info = info_packet()?;
-        invoke(&mut info)?;
-        let mut roots = vec![kernel_cr3, quad(&info, 64), quad(&info, 48)];
-        roots.extend((0..ROOT_HISTORY_COUNT).map(|entry| quad(&info, HEADER_BYTES + entry * 8)));
-        roots.retain(|root| root & !4095 != 0);
-        roots.sort_unstable();
-        roots.dedup();
         let image = image
             .map(Ok)
             .unwrap_or_else(symbols::default_kernel_image)?;
         let cache = cache.map(Ok).unwrap_or_else(symbols::default_cache)?;
         let database = symbols::KernelSymbols::load(&image, &cache)?;
-        let process = database.resolve(&pid.to_string(), 0, &roots, quad(&info, 56))?;
-        (
-            process.kernel_cr3,
-            if process.user_cr3 == 0 {
-                process.kernel_cr3
-            } else {
-                process.user_cr3
-            },
-        )
+        let process = resolve_process(
+            &database,
+            &pid.to_string(),
+            0,
+            (kernel_cr3 != 0).then_some(kernel_cr3),
+        )?;
+        (process.kernel_access_root(), process.user_root())
     } else {
         let root = cr3.ok_or("tracking requires a CR3 root")?;
         if root & !4095 == 0 || gva.is_none() {
@@ -953,13 +946,21 @@ pub fn run(arguments: &[String]) -> Result<i32, String> {
         }
         items = parse_items(operation, &numeric_operands)?;
     }
-    let target_cr3 = if cr3 == 0 { process.kernel_cr3 } else { cr3 };
-    let mut data = json!({"pid": output::hex(process.pid), "name": process.name, "cr3": output::hex(target_cr3), "kernel_cr3": output::hex(process.kernel_cr3), "user_cr3": output::hex(process.user_cr3)});
+    let target_cr3 = if cr3 == 0 { process.user_root() } else { cr3 };
+    let kernel_root = process.kernel_access_root();
+    let user_root = process.user_root();
+    let mut data = json!({"pid": output::hex(process.pid), "name": process.name, "cr3": output::hex(target_cr3), "kernel_cr3": output::hex(kernel_root), "user_cr3": output::hex(user_root)});
+    if kernel_root != process.kernel_cr3 {
+        data["reported_process_cr3"] = json!(output::hex(process.kernel_cr3));
+    }
     if !output::is_json() {
         println!(
-            "pid={} name={} cr3={target_cr3:#x} kernel_cr3={:#x} user_cr3={:#x}",
-            process.pid, process.name, process.kernel_cr3, process.user_cr3
+            "pid={} name={} cr3={target_cr3:#x} kernel_cr3={kernel_root:#x} user_cr3={user_root:#x}",
+            process.pid, process.name
         );
+        if kernel_root != process.kernel_cr3 {
+            println!("reported_process_cr3={:#x}", process.kernel_cr3);
+        }
     }
     if items.is_empty() {
         if output::is_json() {
