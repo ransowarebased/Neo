@@ -1,10 +1,12 @@
 mod analysis_cli;
 mod commands;
+mod investigation;
 mod matrix;
 #[path = "memory_cli.rs"]
 mod memory;
 mod output;
 mod process;
+use neo::protocol;
 mod server;
 mod startup;
 mod telemetry;
@@ -50,3 +52,15 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/update_tests.rs"]
 mod update_tests;
+
+#[cfg(test)]
+#[path = "../../MatrixHV/tests/memory_tests.rs"]
+mod memory_tests;
+
+#[cfg(test)]
+#[path = "../../MatrixHV/tests/tracking_tests.rs"]
+mod tracking_tests;
+
+#[cfg(test)]
+#[path = "../../MatrixHV/tests/interception_tests.rs"]
+mod interception_tests;

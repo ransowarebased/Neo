@@ -2,6 +2,8 @@ pub use matrixhv_sdk::memory::*;
 
 use crate::protocol::memory::{HEADER_BYTES, ITEM_BYTES, READ, WRITE};
 use crate::symbols::{KernelSymbols, Process};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn query_info_with(
@@ -27,6 +29,62 @@ fn query_info_with(
 
 fn query_info() -> Result<Vec<u8>, String> {
     query_info_with(&mut invoke, Duration::from_secs(1))
+}
+
+fn root_cache_path(pid: u64) -> PathBuf {
+    std::env::temp_dir()
+        .join("neo-process-roots-v1")
+        .join(format!("{pid}.bin"))
+}
+
+fn root_hint_at(path: &Path, identity: [u64; 4]) -> Option<u64> {
+    if identity.contains(&0) {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut bytes = [0; 48];
+    file.read_exact(&mut bytes).ok()?;
+    if file.read(&mut [0; 1]).ok()? != 0 || &bytes[..8] != b"NEOROOT1" {
+        return None;
+    }
+    for (expected, encoded) in identity.iter().zip(bytes[8..40].as_chunks::<8>().0) {
+        if *expected != u64::from_le_bytes(*encoded) {
+            return None;
+        }
+    }
+    let root = u64::from_le_bytes(bytes[40..].try_into().ok()?);
+    (root != 0 && root & !0x000f_ffff_ffff_f000 == 0).then_some(root)
+}
+
+pub(crate) fn cached_process_root(identity: [u64; 4]) -> Option<u64> {
+    // This is only a hint. Every caller must validate the live PEB and image again.
+    root_hint_at(&root_cache_path(identity[0]), identity)
+}
+
+fn save_root_hint(path: &Path, identity: [u64; 4], root: u64) -> std::io::Result<()> {
+    if identity.contains(&0) || root == 0 || root & !0x000f_ffff_ffff_f000 != 0 {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    let mut bytes = [0; 48];
+    bytes[..8].copy_from_slice(b"NEOROOT1");
+    for (value, encoded) in identity
+        .into_iter()
+        .chain([root])
+        .zip(bytes[8..].chunks_exact_mut(8))
+    {
+        encoded.copy_from_slice(&value.to_le_bytes());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, bytes)
+}
+
+pub(crate) fn cache_process_root(process: &Process) {
+    if let Some(root) = process.validated_user_cr3 {
+        // Cache failures do not invalidate an otherwise verified process resolution.
+        let _ = save_root_hint(&root_cache_path(process.pid), process.root_identity(), root);
+    }
 }
 
 fn matches_process_image(
@@ -112,7 +170,7 @@ fn matches_process_image(
     check(root, peb, process_name, name_truncated, read).is_some()
 }
 
-fn matched_root_with(
+pub(crate) fn matched_root_with(
     candidates: &[u64],
     peb: u64,
     process_name: &str,
@@ -122,6 +180,7 @@ fn matched_root_with(
     for (index, candidate) in candidates.iter().enumerate() {
         let root = candidate & !4095;
         if root == 0
+            || root & !0x000f_ffff_ffff_f000 != 0
             || candidates[..index]
                 .iter()
                 .any(|previous| previous & !4095 == root)
@@ -202,6 +261,7 @@ pub fn resolve_process(
     let mut process = symbols.resolve(selector, 0, &roots, quad(&info, 56))?;
     let reported_root = process.user_root();
     let requested_root = target_cr3 & !4095;
+    let native_peb = !process.wow64 && process.peb != 0;
     let reported_is_unusable = reported_root & !0x000f_ffff_ffff_ffff != 0 || reported_root == 0;
     let requested_is_distinct = target_cr3 != 0
         && requested_root != process.kernel_cr3
@@ -210,8 +270,8 @@ pub fn resolve_process(
     if process.kernel_cr3 & !0x000f_ffff_ffff_ffff != 0 || process.kernel_cr3 == 0 {
         process.kernel_access_cr3 = process.observed_kernel_cr3;
     }
-    if reported_is_unusable || requested_is_distinct || requested_is_unusable {
-        if process.wow64 || process.peb == 0 {
+    if native_peb || reported_is_unusable || requested_is_distinct || requested_is_unusable {
+        if !native_peb {
             return Err(
                 "cannot validate an alternate root without a native 64-bit process PEB".into(),
             );
@@ -221,10 +281,16 @@ pub fn resolve_process(
                 format!("CR3 {target_cr3:#x} does not map the target PEB and image")
             })?
         } else {
-            observed_user_root(&process, &roots)?
+            let mut candidates = vec![reported_root, process.user_cr3, process.kernel_cr3];
+            candidates.extend(cached_process_root(process.root_identity()));
+            candidates.extend_from_slice(&roots);
+            matched_root(&candidates, &process)
+                .map(Ok)
+                .unwrap_or_else(|| observed_user_root(&process, &candidates))?
         };
         process.validated_user_cr3 = Some(root);
         process.kernel_access_cr3 = process.observed_kernel_cr3;
+        cache_process_root(&process);
     }
     Ok(process)
 }

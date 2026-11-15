@@ -3,7 +3,7 @@ const CONTEXT_RECORD_BYTES: usize = 208;
 /// Maximum frames an unwind walk will emit.
 pub const STACK_MAX_FRAMES: usize = 64;
 use crate::user::{MemoryReader, Module, read_exact, symbolize, u16_at, u32_at, u64_at};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use yaxpeax_arch::LengthedInstruction;
 use yaxpeax_x86::long_mode::{InstDecoder, Opcode, Operand, RegSpec, register_class};
 
@@ -72,32 +72,6 @@ fn runtime_function(
     }
     module.address(function.unwind, 4)?;
     Ok(function)
-}
-
-fn function_table(
-    reader: &mut impl MemoryReader,
-    module: &Module,
-) -> Result<Vec<RuntimeFunction>, String> {
-    let size = module.exception_size as usize;
-    if size == 0 {
-        return Ok(Vec::new());
-    }
-    if size > 12 * 262_144 || !size.is_multiple_of(12) {
-        return Err("invalid or oversized PE exception directory".into());
-    }
-    let bytes = read_exact(reader, module.address(module.exception_rva, size)?, size)?;
-    let mut table: Vec<RuntimeFunction> = Vec::with_capacity(size / 12);
-    for offset in (0..size).step_by(12) {
-        let function = runtime_function(&bytes, offset, module)?;
-        if table
-            .last()
-            .is_some_and(|previous| previous.end > function.begin)
-        {
-            return Err("unsorted or overlapping RUNTIME_FUNCTION table".into());
-        }
-        table.push(function);
-    }
-    Ok(table)
 }
 
 fn stack_word(
@@ -580,14 +554,21 @@ fn lookup_sparse(
     let rva = pc - image.base;
     let mut low = 0;
     let mut high = count;
+    let mut lower_end = 0;
+    let mut upper_begin = image.size;
     while low < high {
         let middle = low + (high - low) / 2;
         let bytes = read_exact(reader, address + u64::from(middle) * 12, 12)?;
         let function = runtime_function(&bytes, 0, image)?;
+        if function.begin < lower_end || function.end > upper_begin {
+            return Err("unsorted or overlapping RUNTIME_FUNCTION table".into());
+        }
         if rva < u64::from(function.begin) {
             high = middle;
+            upper_begin = function.begin;
         } else if rva >= u64::from(function.end) {
             low = middle + 1;
+            lower_end = function.end;
         } else {
             return Ok(Some(function));
         }
@@ -636,7 +617,7 @@ pub fn unwind_with_tables(
     dynamic: &[DynamicTable],
     mut context: UnwindContext,
     maximum: usize,
-    captured: bool,
+    _captured: bool,
 ) -> UnwindResult {
     let mut result = UnwindResult {
         frames: Vec::new(),
@@ -653,7 +634,6 @@ pub fn unwind_with_tables(
     }
     let lower = context.rsp;
     let upper = lower.saturating_add(1024 * 1024).min(0x8000_0000_0000);
-    let mut tables = HashMap::new();
     let mut visited = HashSet::new();
     for index in 0..maximum {
         if context.rip == 0 {
@@ -677,9 +657,10 @@ pub fn unwind_with_tables(
             let mut function = None;
             if let Some(module) = static_image {
                 let size = module.exception_size;
-                if captured && size != 0 {
-                    if size / 12 > TABLE_LIMIT || !size.is_multiple_of(12) {
-                        return Err("invalid or oversized PE exception directory".into());
+                if size != 0 {
+                    // Sparse lookup performs logarithmically many bounded reads, without allocating the table.
+                    if !size.is_multiple_of(12) {
+                        return Err("invalid PE exception directory size".into());
                     }
                     function = lookup_sparse(
                         reader,
@@ -688,21 +669,6 @@ pub fn unwind_with_tables(
                         size / 12,
                         control_pc,
                     )?;
-                } else if !captured {
-                    if let std::collections::hash_map::Entry::Vacant(entry) =
-                        tables.entry(module.base)
-                    {
-                        entry.insert(function_table(reader, module)?);
-                    }
-                    let table = &tables[&module.base];
-                    let rva = control_pc - module.base;
-                    let position =
-                        table.partition_point(|function| u64::from(function.begin) <= rva);
-                    function = position
-                        .checked_sub(1)
-                        .and_then(|position| table.get(position))
-                        .filter(|function| rva < u64::from(function.end))
-                        .copied();
                 }
             }
             let mut dynamic_image = None;

@@ -107,7 +107,16 @@ fn authenticated_package_relocates_only_declared_data() {
 
 #[test]
 fn preflight_accepts_only_matching_supported_resident_state_versions() {
-    for state_abi in [STATE_ABI, STATE_ABI_DATA_SHADOW] {
+    for state_abi in [
+        STATE_ABI,
+        STATE_ABI_DATA_SHADOW,
+        STATE_ABI_VIRTUAL_TSC,
+        STATE_ABI_GUEST_TIME_TSC,
+        STATE_ABI_DEBUGGER,
+        STATE_ABI_EXTENDED_HOOKS,
+        STATE_ABI_EXTENDED_CAPTURE,
+        STATE_ABI_HOST_STACK,
+    ] {
         let (mut bytes, abi, key) = package(2);
         bytes[28..32].copy_from_slice(&state_abi.to_le_bytes());
         resign(&mut bytes);
@@ -124,7 +133,7 @@ fn preflight_accepts_only_matching_supported_resident_state_versions() {
             Error::Abi
         );
         assert_eq!(
-            Package::parse_for_state(&bytes, abi, &key, 3).unwrap_err(),
+            Package::parse_for_state(&bytes, abi, &key, 9).unwrap_err(),
             Error::Abi
         );
         if state_abi == STATE_ABI {
@@ -149,7 +158,7 @@ fn preflight_accepts_only_matching_supported_resident_state_versions() {
         );
     }
     assert!(!supports_state_abi(0));
-    assert!(!supports_state_abi(3));
+    assert!(!supports_state_abi(9));
 }
 
 #[test]

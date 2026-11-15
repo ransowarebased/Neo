@@ -1,3 +1,19 @@
+#[cfg(test)]
+#[path = "../../MatrixHV/src/memory/access.rs"]
+pub(crate) mod access;
+
+#[cfg(test)]
+#[path = "../../MatrixHV/src/memory/tracking.rs"]
+pub(crate) mod tracking;
+
+#[cfg(test)]
+#[path = "../../MatrixHV/src/memory/interception.rs"]
+pub(crate) mod interception;
+
+#[cfg(test)]
+#[path = "../../MatrixHV/src/memory/observation.rs"]
+pub(crate) mod observation;
+
 use crate::output;
 use neo::memory::{
     InterceptionRequest, Item, bitmap_packet, enumerate_targets, fetch_tracking_packet,
@@ -27,7 +43,7 @@ fn tracking_json(bytes: &[u8]) -> Value {
 }
 
 pub(crate) fn interception_json(bytes: &[u8]) -> Result<Value, String> {
-    use neo::protocol::memory::*;
+    use crate::protocol::memory::*;
     if bytes.len() < HEADER_BYTES {
         return Err("truncated interception response".into());
     }
@@ -77,6 +93,61 @@ pub(crate) fn interception_json(bytes: &[u8]) -> Result<Value, String> {
     Ok(data)
 }
 
+pub(crate) fn observation_json(bytes: &[u8], operation: u32) -> Result<Value, String> {
+    use crate::protocol::memory::*;
+    if bytes.len() < HEADER_BYTES {
+        return Err("truncated observation response".into());
+    }
+    if !matches!(operation, WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK) {
+        return Ok(json!({"token": output::hex(quad(bytes, 80)), "state": word(bytes, 112)}));
+    }
+    let size = match operation {
+        WATCH_FETCH => WATCH_RECORD_BYTES,
+        CONTEXT_SNAPSHOT => CONTEXT_RECORD_BYTES,
+        _ => 16,
+    };
+    let count = word(bytes, 32) as usize;
+    let records = bytes
+        .get(HEADER_BYTES..)
+        .and_then(|body| body.get(..count.checked_mul(size)?))
+        .ok_or("invalid observation response count")?;
+    let records: Vec<_> = records
+        .chunks_exact(size)
+        .map(|record| {
+            if operation == STACK_WALK {
+                json!({"rip": output::hex(quad(record, 0)), "rsp": output::hex(quad(record, 8))})
+            } else {
+                let mut data = context_json(record);
+                if operation == WATCH_FETCH {
+                    data["address"] = json!(output::hex(quad(record, 208)));
+                    data["hit_count"] = json!(output::hex(quad(record, 216)));
+                    data["slot"] = json!(output::hex(quad(record, 224)));
+                    data["post_instruction"] =
+                        json!(quad(record, 232) & WATCH_POST_INSTRUCTION != 0);
+                }
+                data
+            }
+        })
+        .collect();
+    Ok(
+        json!({"token": output::hex(quad(bytes, 80)), "next": output::hex(quad(bytes, 88)), "oldest": output::hex(quad(bytes, 96)), "dropped": output::hex(quad(bytes, 120)), "walk_status": word(bytes, 72), "records": records}),
+    )
+}
+
+pub(crate) fn context_json(record: &[u8]) -> Value {
+    let mut data = json!({"sequence": output::hex(quad(record, 0)), "tsc": output::hex(quad(record, 8)), "cr3": output::hex(quad(record, 16)), "rip": output::hex(quad(record, 24)), "rsp": output::hex(quad(record, 32)), "rbp": output::hex(quad(record, 40)), "rflags": output::hex(quad(record, 48)), "gs_base": output::hex(quad(record, 56)), "thread_teb": output::hex(quad(record, 64)), "cpu": output::hex(quad(record, 192)), "cpl": output::hex(quad(record, 200))});
+    for (index, name) in [
+        "rax", "rcx", "rdx", "rbx", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
+        "r14", "r15",
+    ]
+    .iter()
+    .enumerate()
+    {
+        data[*name] = json!(output::hex(quad(record, 72 + index * 8)));
+    }
+    data
+}
+
 pub(crate) fn number(text: &str) -> Result<u64, String> {
     let value = if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         u64::from_str_radix(hex, 16)
@@ -90,7 +161,7 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
     if arguments.first().is_some_and(|command| command == "cpuid") {
         return cpuid_packet(arguments);
     }
-    use neo::protocol::memory::{
+    use crate::protocol::memory::{
         DEBUG_CLEAR, DEBUG_SET, HOOK_ADD, HOOK_DROP, HOOK_INSTALL, HOOK_LIST, HOOK_REMOVE,
         INTERCEPT_CONTEXT_ADD, INTERCEPT_CONTEXT_LIST, INTERCEPT_CONTEXT_REMOVE,
         INTERCEPT_MAX_LEASE_MS, INTERCEPT_RELEASE, INTERCEPT_RENEW, INTERCEPT_STATUS,
@@ -113,15 +184,15 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
     for (option, flag) in [
         (
             "--private-shared-data",
-            neo::protocol::memory::INTERCEPT_PRIVATE_SHARED_DATA,
+            crate::protocol::memory::INTERCEPT_PRIVATE_SHARED_DATA,
         ),
         (
             "--concurrent-writes",
-            neo::protocol::memory::INTERCEPT_CONCURRENT_WRITES,
+            crate::protocol::memory::INTERCEPT_CONCURRENT_WRITES,
         ),
         (
             "--persistent-data",
-            neo::protocol::memory::INTERCEPT_PERSISTENT_DATA,
+            crate::protocol::memory::INTERCEPT_PERSISTENT_DATA,
         ),
     ] {
         if let Some(index) = arguments.iter().position(|value| value == option) {
@@ -164,7 +235,7 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
         (Some("debug-registers"), Some("set")) => DEBUG_SET,
         (Some("debug-registers"), Some("clear")) => DEBUG_CLEAR,
         (Some("hook" | "debug-registers"), Some("status")) => INTERCEPT_STATUS,
-        _ => return Err("usage: neo hook install CR3 ADDRESS HEX [...] [--alternate-cr3 CR3] [--vmfunc] [--concurrent-writes] [--persistent-data] [--lease-ms MS | --no-lease] [--tsc-offset] | hook add TOKEN ADDRESS HEX [...] | hook remove TOKEN [ID] | hook list TOKEN | hook context-add TOKEN CR3 [...] | hook context-remove TOKEN CR3 [...] | hook context-list TOKEN | hook renew TOKEN [--lease-ms MS] | hook release TOKEN | hook status; neo debug-registers set CR3 ADDRESS REDIRECT_RIP [...] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset] | debug-registers clear TOKEN | debug-registers status".into()),
+        _ => return Err("usage: neo hook install CR3 ADDRESS HEX [...] [--alternate-cr3 CR3] [--vmfunc] [--concurrent-writes] [--persistent-data] [--lease-ms MS | --no-lease] [--tsc-offset] | hook add TOKEN ADDRESS HEX [...] | hook remove TOKEN [ID] | hook list TOKEN | hook context-add TOKEN CR3 [...] | hook context-remove TOKEN CR3 [...] | hook context-list TOKEN | hook renew TOKEN [--lease-ms MS] | hook release TOKEN | hook watch TOKEN [--lease-ms MS] | hook status; neo debug-registers set CR3 ADDRESS REDIRECT_RIP [...] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset] | debug-registers clear TOKEN | debug-registers status".into()),
     };
     if operation == INTERCEPT_STATUS && arguments.len() != 2
         || matches!(
@@ -201,10 +272,10 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
         return Err("--data-shadow applies to hook installation or add".into());
     }
     if no_lease {
-        request.flags |= neo::protocol::memory::INTERCEPT_NO_LEASE;
+        request.flags |= crate::protocol::memory::INTERCEPT_NO_LEASE;
     }
     if timing {
-        request.flags |= neo::protocol::memory::INTERCEPT_TSC_OFFSET;
+        request.flags |= crate::protocol::memory::INTERCEPT_TSC_OFFSET;
     }
     if matches!(operation, INTERCEPT_CONTEXT_ADD | INTERCEPT_CONTEXT_REMOVE) {
         if arguments.len() < 4 || arguments.len() > ROOT_HISTORY_COUNT + 1 {
@@ -226,7 +297,7 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
                 return Err("--vmfunc applies only to hook installation".into());
             }
             operands.remove(index);
-            request.flags |= neo::protocol::memory::INTERCEPT_VMFUNC;
+            request.flags |= crate::protocol::memory::INTERCEPT_VMFUNC;
         }
         if let Some(index) = operands.iter().position(|value| value == "--alternate-cr3") {
             let value = operands
@@ -267,7 +338,7 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
         }
     }
     if data_shadow {
-        request.hook_flags = vec![neo::protocol::memory::HOOK_DATA_SHADOW; request.items.len()];
+        request.hook_flags = vec![crate::protocol::memory::HOOK_DATA_SHADOW; request.items.len()];
     }
     neo::memory::interception_packet(&request)
 }
@@ -329,9 +400,103 @@ pub(crate) fn cpuid_packet(arguments: &[String]) -> Result<Vec<u8>, String> {
     neo::memory::interception_packet(&request)
 }
 
+pub(crate) fn filter_packet(arguments: &[String]) -> Result<Vec<u8>, String> {
+    use crate::protocol::memory::*;
+    if arguments.len() < 3 || arguments.get(1).map(String::as_str) != Some("filter") {
+        return Err("usage: neo watch|context filter TOKEN [--thread-teb TEB] [--rip-include START END] [--rip-exclude START END]; empty filters clear restrictions".into());
+    }
+    let operation = match arguments[0].as_str() {
+        "watch" => WATCH_FILTER_SET,
+        "context" => CONTEXT_FILTER_SET,
+        _ => return Err("filters require watch or context".into()),
+    };
+    let mut request = InterceptionRequest {
+        operation,
+        token: number(&arguments[2])?,
+        ..Default::default()
+    };
+    let mut index = 3;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--thread-teb" => {
+                request.filter.thread_teb = number(
+                    arguments
+                        .get(index + 1)
+                        .ok_or("--thread-teb requires a TEB address")?,
+                )?;
+                index += 2;
+            }
+            "--rip-include" | "--rip-exclude" => {
+                let start = number(
+                    arguments
+                        .get(index + 1)
+                        .ok_or("RIP filters require START END")?,
+                )?;
+                let end = number(
+                    arguments
+                        .get(index + 2)
+                        .ok_or("RIP filters require START END")?,
+                )?;
+                request
+                    .filter
+                    .ranges
+                    .push((start, end, arguments[index] == "--rip-exclude"));
+                index += 3;
+            }
+            option => return Err(format!("unknown filter option: {option}")),
+        }
+    }
+    neo::memory::interception_packet(&request)
+}
+
+fn run_filter(arguments: &[String]) -> Result<i32, String> {
+    let mut bytes = filter_packet(arguments)?;
+    let mut info = info_packet()?;
+    invoke(&mut info)?;
+    if word(&info, 72) & crate::protocol::memory::OBSERVATION_FILTER_CAPABILITY == 0 {
+        return Err(
+            "observation filters are unsupported by this hypervisor; update the EFI".into(),
+        );
+    }
+    invoke(&mut bytes)?;
+    let data = json!({"token": output::hex(quad(&bytes, 80)), "filter_applied": true});
+    if output::is_json() {
+        output::success(data)?;
+    } else {
+        println!("token={} filter_applied=true", quad(&bytes, 80));
+    }
+    Ok(0)
+}
+
 pub(crate) fn run_observation(arguments: &[String]) -> Result<i32, String> {
-    use neo::protocol::memory::*;
-    let mut operands = crate::analysis_cli::resolve_operands(arguments)?;
+    use crate::protocol::memory::*;
+    let unwind = arguments.iter().any(|argument| argument == "--unwind");
+    if unwind && arguments.get(1).is_some_and(|action| action == "stack") {
+        return crate::analysis_cli::run_unwind(arguments);
+    }
+    let decode = arguments.iter().any(|argument| argument == "--disasm");
+    let mut option_arguments = arguments.to_vec();
+    let options = crate::analysis_cli::TargetOptions::extract(&mut option_arguments)?;
+    let analysis = crate::investigation::analysis(&mut option_arguments)?;
+    // Only observation setup accepts symbolic operands. The analysis
+    // switches have already been removed from read-only observation requests.
+    let operands_for_fetch = matches!(
+        arguments.get(1).map(String::as_str),
+        Some("fetch" | "snapshot")
+    );
+    let mut operands = if operands_for_fetch {
+        option_arguments
+    } else if decode || unwind {
+        return Err("--disasm and --unwind require watch fetch or context snapshot".into());
+    } else {
+        crate::analysis_cli::resolve_operands(arguments)?
+    };
+    if operands.get(1).is_some_and(|action| action == "filter") {
+        if decode {
+            return Err("--disasm requires watch fetch or context snapshot".into());
+        }
+        return run_filter(&operands);
+    }
     let no_lease = if let Some(index) = operands.iter().position(|value| value == "--no-lease") {
         operands.remove(index);
         true
@@ -342,31 +507,54 @@ pub(crate) fn run_observation(arguments: &[String]) -> Result<i32, String> {
     let command = operands.first().map(String::as_str).unwrap_or("");
     let action = operands.get(1).map(String::as_str).unwrap_or("");
     request.operation = match (command, action) {
-        ("syscall", "set") => SYSCALL_SET,
-        ("syscall", "clear") => SYSCALL_CLEAR,
-        _ => {
-            return Err(
-                "usage: neo syscall set CR3 TOKEN CALLBACK LSTAR [--no-lease]; syscall clear TOKEN"
-                    .into(),
-            );
-        }
+        ("watch", "set") => WATCH_SET, ("watch", "fetch") => WATCH_FETCH, ("watch", "clear") => WATCH_CLEAR,
+        ("context", "set") => CONTEXT_SET, ("context", "clear") => CONTEXT_CLEAR,
+        ("context", "snapshot") => CONTEXT_SNAPSHOT, ("context", "stack") => STACK_WALK,
+        ("syscall", "set") => SYSCALL_SET, ("syscall", "clear") => SYSCALL_CLEAR,
+        _ => return Err("usage: neo watch set CR3 TOKEN ADDRESS write|rw LENGTH [...] [--no-lease]; watch fetch TOKEN CPU CURSOR COUNT; watch clear TOKEN; context set CR3 TOKEN [--no-lease]; context snapshot TOKEN CPU CURSOR COUNT; context stack TOKEN CPU SEQUENCE COUNT (RBP chain); context clear TOKEN; syscall set CR3 TOKEN CALLBACK LSTAR [--no-lease]; syscall clear TOKEN".into()),
     };
     if no_lease {
-        if request.operation != SYSCALL_SET {
+        if !matches!(request.operation, WATCH_SET | CONTEXT_SET | SYSCALL_SET) {
             return Err("--no-lease requires set".into());
         }
         request.flags |= INTERCEPT_NO_LEASE;
     }
-    let value = |index: usize| number(operands.get(index).ok_or("missing syscall operand")?);
+    let value = |index: usize| number(operands.get(index).ok_or("missing observation operand")?);
     match request.operation {
-        SYSCALL_SET => {
-            if operands.len() != 6 {
-                return Err("syscall set requires CR3 TOKEN CALLBACK LSTAR".into());
-            }
+        WATCH_SET | CONTEXT_SET | SYSCALL_SET => {
             request.cr3 = value(2)?;
             request.token = value(3)?;
-            request.callback = value(4)?;
-            request.syscall_entry = value(5)?;
+            if request.operation == WATCH_SET {
+                if operands.len() <= 4 || !(operands.len() - 4).is_multiple_of(3) {
+                    return Err("watch set requires ADDRESS write|rw LENGTH triples".into());
+                }
+                for triple in operands[4..].as_chunks::<3>().0 {
+                    let access = match triple[1].as_str() {
+                        "write" => 1,
+                        "rw" => 3,
+                        _ => return Err("watch access must be write or rw".into()),
+                    };
+                    let length =
+                        u32::try_from(number(&triple[2])?).map_err(|_| "invalid watch length")?;
+                    request
+                        .watchpoints
+                        .push((number(&triple[0])?, access, length));
+                }
+            } else if request.operation == SYSCALL_SET && operands.len() == 6 {
+                request.callback = value(4)?;
+                request.syscall_entry = value(5)?;
+            } else if request.operation != CONTEXT_SET || operands.len() != 4 {
+                return Err("invalid setup operands".into());
+            }
+        }
+        WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK => {
+            if operands.len() != 6 {
+                return Err("fetch requires TOKEN CPU CURSOR COUNT".into());
+            }
+            request.token = value(2)?;
+            request.cpu = u32::try_from(value(3)?).map_err(|_| "invalid CPU")?;
+            request.cursor = value(4)?;
+            request.count = usize::try_from(value(5)?).map_err(|_| "invalid record count")?;
         }
         _ => {
             if operands.len() != 3 {
@@ -376,11 +564,91 @@ pub(crate) fn run_observation(arguments: &[String]) -> Result<i32, String> {
         }
     }
     let mut bytes = neo::memory::interception_packet(&request)?;
+    let snapshots = operands_for_fetch && (decode || unwind) && crate::investigation::available()?;
+    if unwind && !snapshots {
+        return Err("inline unwind requires event snapshots from the updated MatrixHV EFI".into());
+    }
+    if decode && !snapshots && options.selector.is_none() {
+        return Err("legacy disassembly requires --process PID|NAME".into());
+    }
     invoke(&mut bytes)?;
+    if operands_for_fetch && (options.selector.is_some() || snapshots) {
+        let data = if snapshots {
+            crate::investigation::attach(&bytes, &request, &options, analysis)?
+        } else {
+            crate::analysis_cli::decorate_observation(&bytes, request.operation, &options, decode)?
+        };
+        if output::is_json() {
+            output::success(data)?;
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&data).map_err(|error| error.to_string())?
+            );
+        }
+        return Ok(0);
+    }
     if output::is_json() {
-        output::success(
-            json!({"token": output::hex(quad(&bytes, 80)), "state": word(&bytes, 112)}),
-        )?;
+        output::success(observation_json(&bytes, request.operation)?)?;
+        return Ok(0);
+    }
+    if matches!(
+        request.operation,
+        WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK
+    ) {
+        let size = match request.operation {
+            WATCH_FETCH => WATCH_RECORD_BYTES,
+            CONTEXT_SNAPSHOT => CONTEXT_RECORD_BYTES,
+            _ => 16,
+        };
+        println!(
+            "records={} next={} oldest={} dropped={} walk_status={}",
+            word(&bytes, 32),
+            quad(&bytes, 88),
+            quad(&bytes, 96),
+            quad(&bytes, 120),
+            word(&bytes, 72)
+        );
+        for index in 0..word(&bytes, 32) as usize {
+            let record = &bytes[HEADER_BYTES + index * size..HEADER_BYTES + (index + 1) * size];
+            if request.operation == STACK_WALK {
+                println!("rip={:#x} rsp={:#x}", quad(record, 0), quad(record, 8));
+            } else {
+                println!(
+                    "sequence={} tsc={} cr3={:#x} rip={:#x} rsp={:#x} rbp={:#x} rflags={:#x} gs_base={:#x} thread_teb={:#x} cpu={} cpl={}",
+                    quad(record, 0),
+                    quad(record, 8),
+                    quad(record, 16),
+                    quad(record, 24),
+                    quad(record, 32),
+                    quad(record, 40),
+                    quad(record, 48),
+                    quad(record, 56),
+                    quad(record, 64),
+                    quad(record, 192),
+                    quad(record, 200)
+                );
+                for (reg, name) in [
+                    "rax", "rcx", "rdx", "rbx", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11",
+                    "r12", "r13", "r14", "r15",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    print!("{name}={:#x} ", quad(record, 72 + reg * 8));
+                }
+                println!();
+                if request.operation == WATCH_FETCH {
+                    println!(
+                        "address={:#x} hit_count={} slot={} post_instruction={}",
+                        quad(record, 208),
+                        quad(record, 216),
+                        quad(record, 224),
+                        quad(record, 232) & WATCH_POST_INSTRUCTION != 0
+                    );
+                }
+            }
+        }
     } else {
         println!("token={} state={}", quad(&bytes, 80), word(&bytes, 112));
     }
@@ -390,12 +658,45 @@ pub(crate) fn run_observation(arguments: &[String]) -> Result<i32, String> {
 pub(crate) fn run_interception(arguments: &[String]) -> Result<i32, String> {
     let resolved = crate::analysis_cli::resolve_operands(arguments)?;
     let arguments = resolved.as_slice();
+    if arguments.get(1).is_some_and(|action| action == "watch") {
+        let mut renewal = arguments.to_vec();
+        renewal[1] = "renew".into();
+        let template = interception_packet(&renewal)?;
+        if !output::is_json() {
+            println!(
+                "Renewing session {} until this process exits; the watchdog remains armed.",
+                quad(&template, 80)
+            );
+        }
+        loop {
+            let mut bytes = template.clone();
+            if let Err(error) = invoke(&mut bytes) {
+                if word(&bytes, 40) == crate::protocol::memory::Error::Busy as u32 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                return Err(error);
+            }
+            if word(&bytes, 112) != crate::protocol::memory::INTERCEPT_ACTIVE {
+                if word(&bytes, 116) == crate::protocol::memory::INTERCEPT_CAUSE_LEASE {
+                    output::set_error("LEASE_EXPIRED", false);
+                }
+                return Err("session is no longer active".into());
+            }
+            if output::is_json() {
+                output::success(interception_json(&bytes)?)?;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(
+                (u64::from(word(&bytes, 132)) / 3).max(1),
+            ));
+        }
+    }
     let mut bytes = interception_packet(arguments)?;
     let operation = word(&bytes, 12);
-    if operation == neo::protocol::memory::CPUID_SET && quad(&bytes, 144) == 0 {
+    if operation == crate::protocol::memory::CPUID_SET && quad(&bytes, 144) == 0 {
         let mut info = info_packet()?;
         invoke(&mut info)?;
-        if word(&info, 72) & neo::protocol::memory::CPUID_UNGATED_CAPABILITY == 0 {
+        if word(&info, 72) & crate::protocol::memory::CPUID_UNGATED_CAPABILITY == 0 {
             return Err("ungated CPUID profiles are unsupported by this hypervisor; specify --dr3, --dr7-mask and --dr7-value or update the EFI".into());
         }
     }
@@ -405,9 +706,9 @@ pub(crate) fn run_interception(arguments: &[String]) -> Result<i32, String> {
         return Ok(0);
     }
     let state = match word(&bytes, 112) {
-        neo::protocol::memory::INTERCEPT_DISABLED => "disabled",
-        neo::protocol::memory::INTERCEPT_ACTIVE => "active",
-        neo::protocol::memory::INTERCEPT_REVOKED => "revoked",
+        crate::protocol::memory::INTERCEPT_DISABLED => "disabled",
+        crate::protocol::memory::INTERCEPT_ACTIVE => "active",
+        crate::protocol::memory::INTERCEPT_REVOKED => "revoked",
         _ => "unknown",
     };
     println!(
@@ -420,16 +721,17 @@ pub(crate) fn run_interception(arguments: &[String]) -> Result<i32, String> {
         quad(&bytes, 88)
     );
     let cause = match word(&bytes, 116) {
-        neo::protocol::memory::INTERCEPT_CAUSE_NONE => "none",
-        neo::protocol::memory::INTERCEPT_CAUSE_CONTEXT => "nested-or-cache-change",
-        neo::protocol::memory::INTERCEPT_CAUSE_MIXED_ACCESS => {
+        crate::protocol::memory::INTERCEPT_CAUSE_NONE => "none",
+        crate::protocol::memory::INTERCEPT_CAUSE_CONTEXT => "nested-or-cache-change",
+        crate::protocol::memory::INTERCEPT_CAUSE_MIXED_ACCESS => {
             "instruction-fetch-and-data-on-hooked-code"
         }
-        neo::protocol::memory::INTERCEPT_CAUSE_RENDEZVOUS => "cpu-rendezvous-failed",
-        neo::protocol::memory::INTERCEPT_CAUSE_LEASE => "lease-expired",
-        neo::protocol::memory::INTERCEPT_CAUSE_MERGE => "page-merge-conflict",
-        neo::protocol::memory::INTERCEPT_CAUSE_RUNTIME => "profile-runtime-failure",
-        neo::protocol::memory::INTERCEPT_CAUSE_PROGRESS => "instruction-progress-failed",
+        crate::protocol::memory::INTERCEPT_CAUSE_RENDEZVOUS => "cpu-rendezvous-failed",
+        crate::protocol::memory::INTERCEPT_CAUSE_LEASE => "lease-expired",
+        crate::protocol::memory::INTERCEPT_CAUSE_MERGE => "page-merge-conflict",
+        crate::protocol::memory::INTERCEPT_CAUSE_RUNTIME => "profile-runtime-failure",
+        crate::protocol::memory::INTERCEPT_CAUSE_PROGRESS => "instruction-progress-failed",
+        crate::protocol::memory::INTERCEPT_CAUSE_DEBUG_CAPACITY => "debug-slots-unavailable",
         _ => "unknown",
     };
     println!(
@@ -444,29 +746,29 @@ pub(crate) fn run_interception(arguments: &[String]) -> Result<i32, String> {
         quad(&bytes, 152),
         quad(&bytes, 144)
     );
-    if word(&bytes, 128) & neo::protocol::memory::INTERCEPT_NO_LEASE != 0 {
+    if word(&bytes, 128) & crate::protocol::memory::INTERCEPT_NO_LEASE != 0 {
         println!("lease=disabled lifetime=explicit-release");
     }
-    if word(&bytes, 128) & neo::protocol::memory::INTERCEPT_TSC_OFFSET != 0 {
+    if word(&bytes, 128) & crate::protocol::memory::INTERCEPT_TSC_OFFSET != 0 {
         println!(
-            "timing=cpu-local-tsc-offset compensated_ticks={} reference_tsc=unsupported",
+            "timing=cr3-scoped-virtual-tsc compensated_ticks={} reference_tsc=unsupported",
             quad(&bytes, 72)
         );
     }
     println!(
         "contexts={} concurrent_writes={} persistent_data={}",
         word(&bytes, 44),
-        word(&bytes, 128) & neo::protocol::memory::INTERCEPT_CONCURRENT_WRITES != 0,
-        word(&bytes, 128) & neo::protocol::memory::INTERCEPT_PERSISTENT_DATA != 0
+        word(&bytes, 128) & crate::protocol::memory::INTERCEPT_CONCURRENT_WRITES != 0,
+        word(&bytes, 128) & crate::protocol::memory::INTERCEPT_PERSISTENT_DATA != 0
     );
     println!(
         "cpuid_records={} private_shared_data={}",
         word(&bytes, 24),
-        word(&bytes, 128) & neo::protocol::memory::INTERCEPT_PRIVATE_SHARED_DATA != 0
+        word(&bytes, 128) & crate::protocol::memory::INTERCEPT_PRIVATE_SHARED_DATA != 0
     );
     if matches!(
         operation,
-        neo::protocol::memory::HOOK_INSTALL | neo::protocol::memory::HOOK_ADD
+        crate::protocol::memory::HOOK_INSTALL | crate::protocol::memory::HOOK_ADD
     ) {
         for index in 0..word(&bytes, 32) as usize {
             let descriptor = HEADER_BYTES + index * ITEM_BYTES;
@@ -477,7 +779,7 @@ pub(crate) fn run_interception(arguments: &[String]) -> Result<i32, String> {
                 word(&bytes, descriptor + 12)
             );
         }
-    } else if operation == neo::protocol::memory::HOOK_LIST {
+    } else if operation == crate::protocol::memory::HOOK_LIST {
         for index in 0..word(&bytes, 32) as usize {
             let descriptor = HEADER_BYTES + index * ITEM_BYTES;
             println!(
@@ -487,16 +789,16 @@ pub(crate) fn run_interception(arguments: &[String]) -> Result<i32, String> {
                 word(&bytes, descriptor + 16)
             );
         }
-    } else if operation == neo::protocol::memory::INTERCEPT_CONTEXT_LIST {
+    } else if operation == crate::protocol::memory::INTERCEPT_CONTEXT_LIST {
         for index in 0..word(&bytes, 32) as usize {
             println!("context_cr3={:#x}", quad(&bytes, HEADER_BYTES + index * 8));
         }
     }
-    if word(&bytes, 128) & neo::protocol::memory::INTERCEPT_VMFUNC != 0 {
+    if word(&bytes, 128) & crate::protocol::memory::INTERCEPT_VMFUNC != 0 {
         println!(
             "vmfunc=cooperative function=0 execute_slot={} data_slot={} data_writes=mtf",
-            neo::protocol::memory::INTERCEPT_EXECUTE_SLOT,
-            neo::protocol::memory::INTERCEPT_DATA_SLOT
+            crate::protocol::memory::INTERCEPT_EXECUTE_SLOT,
+            crate::protocol::memory::INTERCEPT_DATA_SLOT
         );
     }
     Ok(0)

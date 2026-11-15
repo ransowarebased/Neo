@@ -6,6 +6,12 @@ pub const PACKAGE_MAGIC: &[u8; 8] = b"MATRIXUP";
 pub const PACKAGE_VERSION: u32 = 1;
 pub const STATE_ABI: u32 = 1;
 pub const STATE_ABI_DATA_SHADOW: u32 = 2;
+pub const STATE_ABI_VIRTUAL_TSC: u32 = 3;
+pub const STATE_ABI_GUEST_TIME_TSC: u32 = 4;
+pub const STATE_ABI_DEBUGGER: u32 = 5;
+pub const STATE_ABI_EXTENDED_HOOKS: u32 = 6;
+pub const STATE_ABI_EXTENDED_CAPTURE: u32 = 7;
+pub const STATE_ABI_HOST_STACK: u32 = 8;
 pub const HEADER_BYTES: usize = 256;
 pub const BANK_BYTES: usize = 256 * 1024;
 pub const BANK_PAGES: usize = BANK_BYTES / 4096;
@@ -29,7 +35,17 @@ pub const RECOVERED: u32 = 14;
 pub const QUERY: u32 = 15;
 
 pub const fn supports_state_abi(state_abi: u32) -> bool {
-    matches!(state_abi, STATE_ABI | STATE_ABI_DATA_SHADOW)
+    matches!(
+        state_abi,
+        STATE_ABI
+            | STATE_ABI_DATA_SHADOW
+            | STATE_ABI_VIRTUAL_TSC
+            | STATE_ABI_GUEST_TIME_TSC
+            | STATE_ABI_DEBUGGER
+            | STATE_ABI_EXTENDED_HOOKS
+            | STATE_ABI_EXTENDED_CAPTURE
+            | STATE_ABI_HOST_STACK
+    )
 }
 
 #[repr(u32)]

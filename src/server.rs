@@ -237,8 +237,9 @@ pub fn status_text() -> String {
     if status.matrixhv_present {
         use neo::memory::{info_packet, invoke};
         use neo::protocol::memory::{
-            AD_ENABLED, CPUID_PROFILE_CAPABILITY, CPUID_UNGATED_CAPABILITY,
-            PRIVATE_SHARED_DATA_CAPABILITY, SYSCALL_PROFILE_CAPABILITY, word,
+            AD_ENABLED, CPUID_PROFILE_CAPABILITY, CPUID_UNGATED_CAPABILITY, EVENT_V2_CAPABILITY,
+            EVENT_V3_CAPABILITY, OBSERVATION_CAPABILITY, PRIVATE_SHARED_DATA_CAPABILITY,
+            SYSCALL_PROFILE_CAPABILITY, word,
         };
         if let Ok(mut packet) = info_packet() {
             if invoke(&mut packet).is_ok() {
@@ -252,6 +253,9 @@ pub fn status_text() -> String {
                     ("memory_private_shared_data", PRIVATE_SHARED_DATA_CAPABILITY),
                     ("memory_syscall_profile", SYSCALL_PROFILE_CAPABILITY),
                     ("memory_cpuid_ungated", CPUID_UNGATED_CAPABILITY),
+                    ("memory_event_v2", EVENT_V2_CAPABILITY),
+                    ("memory_event_v3", EVENT_V3_CAPABILITY),
+                    ("memory_observation", OBSERVATION_CAPABILITY),
                 ] {
                     text.push_str(&format!("{name}={}\n", flags & flag != 0));
                 }

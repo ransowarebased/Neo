@@ -3,9 +3,7 @@ use neo::memory::{
     InterceptionRequest, Item, enumerate_page_batch, interception_packet, read_ranges,
     resolve_process, transfer_present,
 };
-use neo::protocol::memory::{
-    BUFFER_BYTES, HEADER_BYTES, INTERCEPT_ACTIVE, INTERCEPT_STATUS, ITEM_BYTES, quad, word,
-};
+use neo::protocol::memory::*;
 use neo::symbols::{self, KernelSymbols, Process};
 use neo::user::{self, Module, Pattern, PatternScanner};
 use serde_json::{Value, json};
@@ -65,6 +63,10 @@ impl TargetOptions {
 }
 
 pub(crate) fn load_modules(process: &Process) -> Result<Vec<Module>, String> {
+    load_initialized_modules(process)?.ok_or_else(|| "loader is not initialized".into())
+}
+
+pub(crate) fn load_initialized_modules(process: &Process) -> Result<Option<Vec<Module>>, String> {
     if process.wow64 {
         return Err(
             "user analysis currently requires a native AMD64 process; WOW64 is unsupported".into(),
@@ -72,7 +74,7 @@ pub(crate) fn load_modules(process: &Process) -> Result<Vec<Module>, String> {
     }
     let mut reader =
         |address, length| Ok(read_ranges(process.user_root(), &[(address, length)])?.remove(0));
-    user::modules(&mut reader, process.peb)
+    user::initialized_modules(&mut reader, process.peb)
 }
 
 pub(crate) fn resolve_operands(arguments: &[String]) -> Result<Vec<String>, String> {
@@ -92,7 +94,10 @@ pub(crate) fn resolve_operands(arguments: &[String]) -> Result<Vec<String>, Stri
                 operands.get(1).map(String::as_str)
             ),
             (Some("hook"), Some("install"))
-                | (Some("syscall" | "debug-registers" | "cpuid"), Some("set"))
+                | (
+                    Some("watch" | "context" | "syscall" | "debug-registers" | "cpuid"),
+                    Some("set")
+                )
         );
         let root = if setup {
             memory::number(operands.get(2).ok_or("installation requires a CR3")?)?
@@ -162,6 +167,127 @@ fn instructions_at(modules: &[Module], root: u64, address: u64) -> Result<(Value
         instructions_json(&user::disassemble(modules, address, &result.bytes, 8)),
         result.is_complete(),
     ))
+}
+
+pub(crate) fn decorate_observation(
+    bytes: &[u8],
+    operation: u32,
+    options: &TargetOptions,
+    decode: bool,
+) -> Result<Value, String> {
+    let selector = options
+        .selector
+        .as_deref()
+        .ok_or("symbolized observations require --process PID|NAME")?;
+    let (_, process) = options.load(selector, 0)?;
+    let modules = load_modules(&process)?;
+    let mut data = memory::observation_json(bytes, operation)?;
+    let size = if operation == WATCH_FETCH {
+        WATCH_RECORD_BYTES
+    } else {
+        CONTEXT_RECORD_BYTES
+    };
+    if let Some(records) = data["records"].as_array_mut() {
+        for (index, record) in records.iter_mut().enumerate() {
+            let raw = &bytes[HEADER_BYTES + index * size..HEADER_BYTES + (index + 1) * size];
+            let root = quad(raw, 16) & !4095;
+            if root != process.kernel_cr3 && root != process.user_root() {
+                record["analysis_error"] =
+                    json!("captured CR3 does not belong to the selected process");
+                continue;
+            }
+            let rip = quad(raw, 24);
+            record["symbol"] = json!(user::symbolize(&modules, rip));
+            if decode && quad(raw, 200) == 3 {
+                match instructions_at(&modules, process.user_root(), rip) {
+                    Ok((instructions, complete)) => {
+                        record["instructions"] = instructions;
+                        record["instruction_read_complete"] = json!(complete);
+                    }
+                    Err(error) => {
+                        record["analysis_error"] = json!(error);
+                    }
+                }
+            }
+        }
+    }
+    data["memory_consistency"] = json!("live_reads_after_capture");
+    Ok(data)
+}
+
+pub(crate) fn run_unwind(arguments: &[String]) -> Result<i32, String> {
+    let mut operands = arguments.to_vec();
+    let options = TargetOptions::extract(&mut operands)?;
+    let analysis = crate::investigation::analysis(&mut operands)?;
+    if operands.len() != 6 || operands[0] != "context" || operands[1] != "stack" {
+        return Err("usage: neo context stack TOKEN CPU SEQUENCE COUNT --unwind --process PID|NAME [--kernel-cr3 CR3 --kernel-image PATH --symbols DIRECTORY]".into());
+    }
+    let maximum =
+        usize::try_from(memory::number(&operands[5])?).map_err(|_| "invalid frame count")?;
+    if maximum == 0 || maximum > STACK_MAX_FRAMES {
+        return Err("frame count must be 1..64".into());
+    }
+    let cpu = u32::try_from(memory::number(&operands[3])?).map_err(|_| "invalid CPU")?;
+    let token = memory::number(&operands[2])?;
+    let sequence = memory::number(&operands[4])?;
+    if crate::investigation::available()? {
+        return analysis.captured_stack(token, cpu, sequence, maximum, &options);
+    }
+    let mut bytes = interception_packet(&InterceptionRequest {
+        operation: CONTEXT_RECORD_GET,
+        token,
+        cpu,
+        cursor: sequence,
+        count: 1,
+        ..Default::default()
+    })?;
+    let selector = options
+        .selector
+        .as_deref()
+        .ok_or("user unwind requires --process PID|NAME")?;
+    let mut info = neo::memory::info_packet()?;
+    memory::invoke(&mut info)?;
+    if word(&info, 72) & OBSERVATION_FILTER_CAPABILITY == 0 {
+        return Err(
+            "cached context retrieval is unsupported by this hypervisor; update the EFI".into(),
+        );
+    }
+    memory::invoke(&mut bytes)?;
+    let record = &bytes[HEADER_BYTES..];
+    let context = neo::unwind::UnwindContext::from_record(record)?;
+    let (_, process) = options.load(selector, quad(record, 16))?;
+    let modules = load_modules(&process)?;
+    let mut reader =
+        |address, length| Ok(read_ranges(process.user_root(), &[(address, length)])?.remove(0));
+    let tables = analysis.live_tables(&mut reader, &modules)?;
+    let result =
+        neo::unwind::unwind_with_tables(&mut reader, &modules, &tables, context, maximum, false);
+    let data = json!({"frames": result.frames.iter().map(|frame| json!({"rip": output::hex(frame.rip), "rsp": output::hex(frame.rsp),
+        "symbol": frame.symbol, "method": frame.method})).collect::<Vec<_>>(), "stop": result.stop,
+        "complete": result.complete, "memory_consistency": "live_reads_after_capture", "unwind_versions": [1]});
+    if output::is_json() {
+        if result.complete {
+            output::success(data)?;
+        } else {
+            output::partial(
+                data,
+                "UNWIND_PARTIAL",
+                "stack walk stopped; inspect stop and frames before using the result",
+            )?;
+        }
+    } else {
+        for frame in &result.frames {
+            println!(
+                "rip={:#x} rsp={:#x} {} [{}]",
+                frame.rip, frame.rsp, frame.symbol, frame.method
+            );
+        }
+        println!(
+            "complete={} stop={} memory_consistency=live_reads_after_capture",
+            result.complete, result.stop
+        );
+    }
+    Ok(i32::from(!result.complete))
 }
 
 fn take_flag(arguments: &mut Vec<String>, name: &str) -> bool {
@@ -237,7 +363,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<i32, String> {
     } else {
         load_modules(&process)?
     };
-    let mut data = json!({"pid": output::hex(process.pid), "name": process.name,
+    let mut data = json!({"pid": output::hex(process.pid), "name": process.name, "creation_time": output::hex(process.creation_time),
         "user_cr3": output::hex(process.user_root()), "memory_consistency": "live_observational"});
     let mut partial = false;
     match command.as_str() {

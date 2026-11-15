@@ -1,6 +1,6 @@
 use crate::server::protocol::{
-    DEFAULT_EXEC_TIMEOUT_MS, ProtocolError, Request, RequestKind, Response, read_response,
-    write_request,
+    DEFAULT_EXEC_TIMEOUT_MS, MAX_FRAME_SIZE, ProtocolError, Request, RequestKind, Response,
+    read_response, write_request,
 };
 use crate::server::{self, DEFAULT_LISTEN_ADDRESS, ServerExit};
 use crate::{matrix, output, startup, telemetry};
@@ -68,12 +68,17 @@ pub fn run(mut arguments: Vec<String>) -> Result<i32, String> {
                 return Err(status.message);
             }
             let executable = status_field(&status.message, "executable_path")?;
+            let session_query = matches!(arguments.as_slice(), [command, action, ..]
+                if command == "session" && action == "query");
             let mut command = vec![executable.to_string()];
             if output::is_json() {
                 command.push("--json".into());
             }
             command.extend(arguments);
             let timeout = timeout.max(Duration::from_millis(timeout_ms) + Duration::from_secs(10));
+            if session_query && status_field(&status.message, "exec_stream") == Ok("true") {
+                return stream_execution(&remote, timeout, command, timeout_ms);
+            }
             let response = transact(
                 &remote,
                 timeout,
@@ -83,6 +88,13 @@ pub fn run(mut arguments: Vec<String>) -> Result<i32, String> {
                 },
             )?;
             ensure_kind(&response, RequestKind::Exec)?;
+            if session_query
+                && response.stdout.len() >= server::MAX_CAPTURED_STREAM_SIZE
+                && !response.message.starts_with("process timed out")
+            {
+                output::set_error("REMOTE_OUTPUT_LIMIT", false);
+                return Err("remote server reached its output limit; update Neo on the server to stream session queries".into());
+            }
             return print_execution(response, true);
         }
         return run_memory(&arguments);
@@ -178,6 +190,9 @@ fn memory_options(arguments: &[String]) -> Result<Option<MemoryOptions>, String>
         Some(
             "read"
                 | "write"
+                | "watch"
+                | "context"
+                | "session"
                 | "syscall"
                 | "hook"
                 | "debug-registers"
@@ -208,11 +223,27 @@ fn parse_duration(value: &str, option: &str, maximum: u64) -> Result<u64, String
 fn run_memory(arguments: &[String]) -> Result<i32, String> {
     if arguments
         .first()
+        .is_some_and(|command| command == "session")
+        || matches!(
+            (
+                arguments.first().map(String::as_str),
+                arguments.get(1).map(String::as_str)
+            ),
+            (Some("watch"), Some("record"))
+        )
+    {
+        return crate::investigation::run(arguments);
+    }
+    if arguments
+        .first()
         .is_some_and(|command| matches!(command.as_str(), "memmap" | "modules" | "scan" | "disasm"))
     {
         return crate::analysis_cli::run(arguments);
     }
-    if arguments.first().map(String::as_str) == Some("syscall") {
+    if matches!(
+        arguments.first().map(String::as_str),
+        Some("watch" | "context" | "syscall")
+    ) {
         return crate::memory::run_observation(arguments);
     }
     if matches!(
@@ -535,6 +566,101 @@ fn print_execution(response: Response, self_command: bool) -> Result<i32, String
             .write_all(&response.stderr)
             .map_err(|error| format!("failed to write process stderr: {error}"))?;
         if !response.success {
+            eprintln!("{} exit_code={exit_code}", response.message);
+        }
+    }
+    Ok(exit_code)
+}
+
+fn stream_execution(
+    remote: &str,
+    timeout: Duration,
+    arguments: Vec<String>,
+    timeout_ms: u64,
+) -> Result<i32, String> {
+    let (mut stream, id) = send_request(
+        remote,
+        timeout,
+        Request::ExecStream {
+            arguments,
+            timeout_ms,
+        },
+    )?;
+    let mut pending = Vec::new();
+    let mut last_ok = None;
+    let json = output::is_json();
+    let response = loop {
+        let response = receive_response(&mut stream, id)?;
+        ensure_kind(&response, RequestKind::ExecStream)?;
+        if response.exit_code.is_some() {
+            break response;
+        }
+        if !response.success
+            || !response.message.is_empty()
+            || response.stdout.is_empty() && response.stderr.is_empty()
+        {
+            output::set_error("PROTOCOL_ERROR", false);
+            return Err("invalid remote execution stream frame".into());
+        }
+        io::stderr()
+            .write_all(&response.stderr)
+            .map_err(|error| error.to_string())?;
+        if !json {
+            io::stdout()
+                .write_all(&response.stdout)
+                .and_then(|()| io::stdout().flush())
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
+        let complete = response
+            .stdout
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |last| pending.len() + last + 1);
+        pending.extend_from_slice(&response.stdout);
+        for line in pending[..complete].split_inclusive(|&byte| byte == b'\n') {
+            if line.len() > MAX_FRAME_SIZE {
+                output::set_error("REMOTE_OUTPUT_LIMIT", false);
+                return Err("remote JSON row exceeds the maximum size".into());
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let row: serde_json::Value = serde_json::from_slice(line).map_err(|error| {
+                output::set_error("REMOTE_OUTPUT_INVALID", false);
+                format!("invalid JSON row from remote command: {error}")
+            })?;
+            last_ok = row.get("ok").and_then(serde_json::Value::as_bool);
+            if last_ok.is_none() {
+                output::set_error("REMOTE_OUTPUT_INVALID", false);
+                return Err("remote JSON row has no result status".into());
+            }
+            output::write(&row)?;
+        }
+        pending.drain(..complete);
+        if pending.len() > MAX_FRAME_SIZE {
+            output::set_error("REMOTE_OUTPUT_LIMIT", false);
+            return Err("remote JSON row exceeds the maximum size".into());
+        }
+    };
+
+    let exit_code = response.exit_code.unwrap();
+    if response.success != (exit_code == 0)
+        || !response.stdout.is_empty()
+        || !response.stderr.is_empty()
+    {
+        output::set_error("PROTOCOL_ERROR", false);
+        return Err("invalid terminal frame from remote command".into());
+    }
+    if json && response.success && (!pending.is_empty() || last_ok != Some(true)) {
+        output::set_error("REMOTE_OUTPUT_INVALID", false);
+        return Err("remote command did not finish with a complete JSON result".into());
+    }
+    if !response.success {
+        if json && (last_ok != Some(false) || !pending.is_empty() || exit_code == 124) {
+            let (code, _) = output::classify(&response.message);
+            output::partial(json!({"exit_code": exit_code}), code, &response.message)?;
+        } else if !json {
             eprintln!("{} exit_code={exit_code}", response.message);
         }
     }
@@ -1053,7 +1179,10 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
 
 fn print_usage() {
     println!(
-        "neo cpuid set CR3 [--token TOKEN] --record LEAF SUBLEAF MASK EAX EBX ECX EDX KEEP_EAX KEEP_EBX KEEP_ECX KEEP_EDX [--record ...] [--dr3 ADDRESS --dr7-mask MASK --dr7-value VALUE] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo cpuid clear TOKEN | cpuid status\nneo memmap PID|NAME CR3|auto [--resident] [--output PATH]\nneo modules PID|NAME CR3|auto [--sections] [--exports] [--output PATH]\nneo scan PID|NAME CR3|auto --pattern \"48 8B ??\" [--start ADDRESS --end ADDRESS] [--max-hits COUNT] [--disasm] [--output PATH]\nneo disasm PID|NAME CR3|auto ADDRESS SIZE [--output PATH]\nneo read PID|NAME CR3|auto ADDRESS SIZE [--disasm]\n"
+        "neo session set CR3|auto TOKEN --process PID|NAME --instruction ADDRESS|MODULE+RVA [--arg-reg REG[+OFFSET|-OFFSET] BYTES DEPTH] [--arg-stack OFFSET BYTES DEPTH] [--region ADDRESS BYTES] [--stack-bytes 1..2048] [--code-pages] [--snapshot-arm] [--snapshot-after] [--max-events COUNT | --circular] [--lease-ms MS]\nneo session status [TOKEN] | session fetch TOKEN CPU CURSOR COUNT\nneo session compare FILE.jsonl CPU:SEQUENCE CPU:SEQUENCE\nneo session export FILE.jsonl --output DIRECTORY\nInstruction capture runs before the instruction using a hardware execution trap. Its default is one hit. Argument depth 0 captures a scalar (BYTES=0); depth 1 copies its pointee; depth 2 follows another pointer. Regions accept up to 4096 bytes each; regions and arguments share twelve slots. Depth 1 copies at REG+OFFSET; depth 2 follows the pointer at REG+OFFSET. Offsets are signed 16-bit values. Snapshots contain per-page read status, mapping identity and effective guest permissions. Other threads can continue running, so these are not atomic snapshots of the whole process. The after snapshot uses MTF after the original instruction; ARM has process context without target register values. Comparison, SHA-256, symbols, unwind and binary export run in Neo."
+    );
+    println!(
+        "neo cpuid set CR3 [--token TOKEN] --record LEAF SUBLEAF MASK EAX EBX ECX EDX KEEP_EAX KEEP_EBX KEEP_ECX KEEP_EDX [--record ...] [--dr3 ADDRESS --dr7-mask MASK --dr7-value VALUE] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo cpuid clear TOKEN | cpuid status\nneo memmap PID|NAME CR3|auto [--resident] [--output PATH]\nneo modules PID|NAME CR3|auto [--sections] [--exports] [--output PATH]\nneo scan PID|NAME CR3|auto --pattern \"48 8B ??\" [--start ADDRESS --end ADDRESS] [--max-hits COUNT] [--disasm] [--output PATH]\nneo disasm PID|NAME CR3|auto ADDRESS SIZE [--output PATH]\nneo read PID|NAME CR3|auto ADDRESS SIZE [--disasm]\nneo watch|context filter TOKEN [--thread-teb TEB] [--rip-include START END] [--rip-exclude START END]\nneo watch fetch TOKEN CPU CURSOR COUNT [--process PID|NAME] [--disasm] [--unwind]\nneo context snapshot TOKEN CPU CURSOR COUNT [--process PID|NAME] [--disasm] [--unwind]\nneo context stack TOKEN CPU SEQUENCE COUNT --unwind [--process PID|NAME]\nneo session set CR3 TOKEN [--sample] [--exceptions MASK] [--region ADDRESS SIZE ...] [--entry ADDRESS --return ADDRESS ...] [--exception-dispatch ADDRESS] [--no-lease | --lease-ms MS]\nneo session clear TOKEN\nneo session record TOKEN --output FILE.jsonl [--seconds N] [--interval-ms N] [--cpu CPU] [--process PID|NAME] [--disasm] [--unwind]\nneo watch record TOKEN --output FILE.jsonl [--seconds N] [--interval-ms N] [--cpu CPU] [--process PID|NAME] [--disasm] [--unwind]\nneo session query FILE.jsonl [--kind KIND] [--cpu CPU] [--sequence N] [--thread-teb TEB] [--invocation ID] [--limit N] [--disasm] [--unwind]\nneo session tree FILE.jsonl [--thread-teb TEB]\nUnwind options include --frames N, --dynamic-list HEAD, and repeatable --table BASE START END ADDRESS COUNT (sorted AMD64 runtime functions). Capture code, function tables and unwind metadata with --region for offline analysis.\nAnalysis accepts --kernel-cr3 CR3 --kernel-image PATH --symbols DIRECTORY, --json and --remote HOST:PORT. Paths refer to the target host.\nADDRESS accepts integers, module!export (including forwarded exports and #ordinals), and module+offset. Symbolic interception addresses require --process PID|NAME.\n--private-shared-data requires a full 4096-byte hook patch at 0x7ffe0000 and a lease; VMFUNC, concurrent writes, persistent data and data-shadow on that page are incompatible.\nCPUID gates are optional on updated hypervisors; specify all three DR options to enable gating. Keep masks preserve native bits before replacement values are ORed.\nFilters use exclusive range ends, exclusions win, and an empty filter clears restrictions. Filters persist within the session and affect future captures. Watch RIP is post-instruction.\nEvent snapshots retain 32 instruction bytes, up to 2048 stack bytes and four selected regions of up to 4096 bytes each. Peer CPUs can still modify shared memory during the VM exit. Paired entry/return probes require the caller continuation address after CALL; --instruction probes accept a single instruction address. They share the four debug slots with watchpoints and redirects. Hardware exceptions use a bit mask by x86 vector. --exception-dispatch accepts the address of native AMD64 RtlDispatchException and records the dispatched Windows exception. AMD64 unwind supports version 1 PE and dynamic tables. A missing snapshot range stops unwind with a partial stack. Legacy context stack on older EFI uses live reads and labels them accordingly.\n"
     );
     println!(
         "Use --json with status, ping, telemetry, PT, memory, startup, update, or remote exec. JSON results use {{\"ok\":true,\"data\":...}} or {{\"ok\":false,\"error\":{{\"code\":...,\"message\":...,\"retryable\":...}}}}. All u64 values use fixed-width hexadecimal strings. Telemetry emits one JSON object per sample (JSONL), including --output files. Memory commands accept --remote ADDRESS:PORT; paths refer to the remote host. Use --exec-timeout-ms 1..3600000 before exec, or anywhere with remote memory commands (default 290000 ms). The server terminates the process tree on timeout. Socket waits allow the execution deadline plus cleanup time.\n"
@@ -1062,7 +1191,7 @@ fn print_usage() {
         "neo telemetry --benchmark [--seconds 1..3600] [--interval-ms 50..60000] [--output FILE]\nBenchmark measures CPUID leaf 0 from guest to guest, including VM exit, handling and reentry.\nIt pins each available registered CPU and reports raw/calibrated TSC ticks, nanoseconds and min/mean/p50/p95/p99/max.\nCollection settings stay unchanged; compare telemetry disabled/enabled in separate runs.\nAn invariant TSC and clock diagnostics are required; release profiles using TSC compensation first.\nWith --remote, the benchmark runs on the remote server.\n"
     );
     println!(
-        "neo hook install CR3 ADDRESS HEX [...] [--alternate-cr3 CR3] [--vmfunc] [--concurrent-writes] [--persistent-data] [--data-shadow] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo hook add TOKEN ADDRESS HEX [...] [--data-shadow] | hook remove TOKEN [ID] | hook list TOKEN\nneo hook context-add TOKEN CR3 [...] | hook context-remove TOKEN CR3 [...] | hook context-list TOKEN\nneo hook renew TOKEN [--lease-ms MS] | hook release TOKEN | hook status\nneo debug-registers set CR3 ADDRESS REDIRECT_RIP [...] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo debug-registers clear TOKEN | debug-registers status\nneo syscall set CR3 TOKEN CALLBACK LSTAR [--no-lease] | syscall clear TOKEN\nUse TOKEN=0 for a new profile; successful setup returns the shared current token.\nVMFUNC uses EAX=0 and ECX=0 (execute) or 1 (data) from unhooked code.\nData shadows keep private page contents, including guest writes allowed by the original PTE.\nOne profile admits the primary CR3 and validated aliases. Conflicting original writes revoke the profile.\nThe default lease is 30 seconds. --no-lease requires explicit release and does not need a VMX preemption timer.\nTSC compensation is CPU-local and requires an invariant TSC without Hyper-V Reference TSC or scaling. Guest CPU migration can expose clock skew.\n"
+        "neo hook install CR3 ADDRESS HEX [...] [--alternate-cr3 CR3] [--vmfunc] [--concurrent-writes] [--persistent-data] [--data-shadow] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo hook add TOKEN ADDRESS HEX [...] [--data-shadow] | hook remove TOKEN [ID] | hook list TOKEN\nneo hook context-add TOKEN CR3 [...] | hook context-remove TOKEN CR3 [...] | hook context-list TOKEN\nneo hook renew TOKEN [--lease-ms MS] | hook watch TOKEN [--lease-ms MS] | hook release TOKEN | hook status\nneo debug-registers set CR3 ADDRESS REDIRECT_RIP [...] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo debug-registers clear TOKEN | debug-registers status\nneo watch set CR3 TOKEN ADDRESS write|rw LENGTH [...] [--no-lease]\nneo watch fetch TOKEN CPU CURSOR COUNT | watch clear TOKEN\nneo context set CR3 TOKEN [--no-lease] | context snapshot TOKEN CPU CURSOR COUNT\nneo context stack TOKEN CPU SEQUENCE COUNT | context clear TOKEN\nneo syscall set CR3 TOKEN CALLBACK LSTAR [--no-lease] | syscall clear TOKEN\nUse TOKEN=0 for a new profile; successful setup returns the shared current token.\nWatch RIP is the post-access PC. Context stack follows a bounded RBP chain; optimized frames may be omitted.\nVMFUNC uses EAX=0 and ECX=0 (execute) or 1 (data) from unhooked code.\nData shadows keep private page contents, including guest writes allowed by the original PTE.\nOne profile admits the primary CR3 and validated aliases. Conflicting original writes revoke the profile.\nThe default lease is 30 seconds; hook watch renews it until the process exits. --no-lease requires explicit release and does not need a VMX preemption timer.\nTSC compensation virtualizes user RDTSC/RDTSCP on the registered CR3 roots with a shared monotonic clock. Other roots retain native reads. It requires an invariant TSC without Hyper-V Reference TSC, scaling, or active nested VMX. Physical exit latency is unchanged.\n"
     );
     if cfg!(target_os = "windows") {
         println!(

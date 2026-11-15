@@ -381,12 +381,22 @@ fn unicode_string(
 }
 
 pub fn modules(reader: &mut impl MemoryReader, peb: u64) -> Result<Vec<Module>, String> {
+    initialized_modules(reader, peb)?.ok_or_else(|| "loader is not initialized".into())
+}
+
+pub fn initialized_modules(
+    reader: &mut impl MemoryReader,
+    peb: u64,
+) -> Result<Option<Vec<Module>>, String> {
     if !user_pointer(peb) {
         return Err("process has no valid native x64 PEB".into());
     }
     let ldr = u64_at(&read_exact(reader, peb, 0x20)?, 0x18)?;
+    if ldr == 0 {
+        return Ok(None);
+    }
     if !user_pointer(ldr) {
-        return Err("loader is not initialized".into());
+        return Err("process has an invalid native x64 loader pointer".into());
     }
     let head = ldr.checked_add(0x20).ok_or("loader list overflow")?;
     let initial = read_exact(reader, head, 16)?;
@@ -426,7 +436,7 @@ pub fn modules(reader: &mut impl MemoryReader, peb: u64) -> Result<Vec<Module>, 
     {
         return Err("overlapping loaded modules".into());
     }
-    Ok(result)
+    Ok(Some(result))
 }
 
 fn module_matches(name: &str, query: &str) -> bool {

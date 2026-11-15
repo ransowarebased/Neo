@@ -42,6 +42,33 @@ fn analysis_packets_validate_cli_fields_and_preserve_json_option_values() {
     arguments.push("--no-lease".into());
     arguments.extend(args(&["--lease-ms", "100"]));
     assert!(crate::memory::cpuid_packet(&arguments).is_err());
+    let bytes = crate::memory::filter_packet(&args(&[
+        "watch",
+        "filter",
+        "1",
+        "--thread-teb",
+        "0x3000",
+        "--rip-include",
+        "0x1000",
+        "0x2000",
+        "--rip-exclude",
+        "0x1100",
+        "0x1200",
+    ]))
+    .unwrap();
+    assert_eq!(neo::protocol::memory::word(&bytes, 32), 2);
+    assert_eq!(neo::protocol::memory::quad(&bytes, 24), 0x3000);
+    assert!(
+        crate::memory::filter_packet(&args(&[
+            "context",
+            "filter",
+            "1",
+            "--rip-include",
+            "2",
+            "1"
+        ]))
+        .is_err()
+    );
     let mut arguments = args(&["scan", "123", "auto", "--pattern", "--json", "--json"]);
     output::begin(&mut arguments);
     assert!(output::is_json());
@@ -82,7 +109,7 @@ fn u64_fields_and_memory_results_preserve_every_bit() {
         },
         Transfer {
             address: 0x3000,
-            status: neo::protocol::memory::ROAD_STATUS_DEMAND_ZERO,
+            status: crate::protocol::memory::ROAD_STATUS_DEMAND_ZERO,
             transferred: 2,
             requested: 2,
             bytes: vec![0, 0],
@@ -200,6 +227,24 @@ fn telemetry_jsonl_files_keep_full_width_values_and_escaped_text() {
             .starts_with("0x")
     );
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn observation_and_hook_json_reject_truncation_and_keep_register_precision() {
+    use crate::protocol::memory::*;
+    assert!(crate::memory::observation_json(&[], WATCH_FETCH).is_err());
+    assert!(crate::memory::interception_json(&[]).is_err());
+    let mut bytes = vec![0u8; HEADER_BYTES + WATCH_RECORD_BYTES];
+    bytes[32..36].copy_from_slice(&1u32.to_le_bytes());
+    bytes[80..88].copy_from_slice(&u64::MAX.to_le_bytes());
+    bytes[HEADER_BYTES + 24..HEADER_BYTES + 32].copy_from_slice(&u64::MAX.to_le_bytes());
+    bytes[HEADER_BYTES + 208..HEADER_BYTES + 216].copy_from_slice(&(u64::MAX - 1).to_le_bytes());
+    let data = crate::memory::observation_json(&bytes, WATCH_FETCH).unwrap();
+    assert_eq!(data["token"], "0xffffffffffffffff");
+    assert_eq!(data["records"][0]["rip"], "0xffffffffffffffff");
+    assert_eq!(data["records"][0]["address"], "0xfffffffffffffffe");
+    bytes[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(crate::memory::observation_json(&bytes, WATCH_FETCH).is_err());
 }
 
 #[test]

@@ -286,7 +286,17 @@ enum VadCommit {
 
 fn layouts(
     database: &mut pdb::PDB<'_, File>,
-) -> Result<(Layout, Layout, usize, SoftPteLayout, VadLayout), String> {
+) -> Result<
+    (
+        Layout,
+        Layout,
+        usize,
+        SoftPteLayout,
+        VadLayout,
+        Option<usize>,
+    ),
+    String,
+> {
     let types = database
         .type_information()
         .map_err(|error| error.to_string())?;
@@ -301,6 +311,8 @@ fn layouts(
                 name.as_str(),
                 "_EPROCESS"
                     | "_KPROCESS"
+                    | "_TEB"
+                    | "_CLIENT_ID"
                     | "_MMPTE_SOFTWARE"
                     | "_MMPTE_TRANSITION"
                     | "_MMPTE_PROTOTYPE"
@@ -453,12 +465,30 @@ fn layouts(
         private_mask: mask("_MMVAD_FLAGS", "PrivateMemory")?,
         bytes: vad.size,
     };
-    Ok((process, kernel, name_bytes, soft, vad_layout))
+    let thread_id_offset = (|| {
+        let teb = layout("_TEB").ok()?;
+        let client_id = layout("_CLIENT_ID").ok()?;
+        let offset = teb
+            .fields
+            .get("ClientId")?
+            .0
+            .checked_add(client_id.fields.get("UniqueThread")?.0)?;
+        (offset & 7 == 0 && offset.checked_add(8)? <= teb.size).then_some(offset)
+    })();
+    Ok((
+        process,
+        kernel,
+        name_bytes,
+        soft,
+        vad_layout,
+        thread_id_offset,
+    ))
 }
 
 pub struct Process {
     object: u64,
     pub pid: u64,
+    pub creation_time: u64,
     pub name: String,
     pub(crate) name_truncated: bool,
     /// Raw directory-table value recorded in the Windows process object.
@@ -473,6 +503,10 @@ pub struct Process {
 }
 
 impl Process {
+    pub(crate) fn root_identity(&self) -> [u64; 4] {
+        [self.pid, self.creation_time, self.object, self.peb]
+    }
+
     pub fn user_root(&self) -> u64 {
         if let Some(root) = self.validated_user_cr3 {
             root
@@ -504,6 +538,9 @@ pub struct KernelSymbols {
     syscall_rvas: Vec<u32>,
     process_bytes: usize,
     pid_offset: usize,
+    creation_offset: usize,
+    exit_offset: usize,
+    pub thread_id_offset: Option<usize>,
     links_offset: usize,
     name_offset: usize,
     name_bytes: usize,
@@ -558,7 +595,8 @@ impl KernelSymbols {
         if syscall_rvas.is_empty() {
             return Err("PDB is missing kernel syscall entry symbols".into());
         }
-        let (process, kernel, name_bytes, soft_layout, vad) = layouts(&mut database)?;
+        let (process, kernel, name_bytes, soft_layout, vad, thread_id_offset) =
+            layouts(&mut database)?;
         let field = |layout: &Layout, name: &str| -> Result<usize, String> {
             layout
                 .fields
@@ -574,6 +612,9 @@ impl KernelSymbols {
             syscall_rvas,
             process_bytes: process.size,
             pid_offset: field(&process, "UniqueProcessId")?,
+            creation_offset: field(&process, "CreateTime")?,
+            exit_offset: field(&process, "ExitTime")?,
+            thread_id_offset,
             links_offset: field(&process, "ActiveProcessLinks")?,
             name_offset: field(&process, "ImageFileName")?,
             soft_layout,
@@ -588,6 +629,8 @@ impl KernelSymbols {
         };
         for (offset, length) in [
             (result.pid_offset, 8),
+            (result.creation_offset, 8),
+            (result.exit_offset, 8),
             (result.links_offset, 16),
             (result.name_offset, name_bytes),
             (result.directory_offset, 8),
@@ -722,6 +765,25 @@ impl KernelSymbols {
             )?;
         let initial = read_ranges(kernel_cr3, &[(base + u64::from(self.initial_process), 8)])?;
         let first = quad(&initial[0], 0)?;
+        self.resolve_list_with(
+            selector,
+            target_cr3,
+            kernel_cr3,
+            first,
+            kernel_roots,
+            &mut |root, address, length| Ok(read_ranges(root, &[(address, length)])?.remove(0)),
+        )
+    }
+
+    fn resolve_list_with(
+        &self,
+        selector: &str,
+        target_cr3: u64,
+        kernel_cr3: u64,
+        first: u64,
+        kernel_roots: &[u64],
+        read: &mut impl FnMut(u64, u64, usize) -> Result<Vec<u8>, String>,
+    ) -> Result<Process, String> {
         let numeric = if let Some(hex) = selector
             .strip_prefix("0x")
             .or_else(|| selector.strip_prefix("0X"))
@@ -739,19 +801,70 @@ impl KernelSymbols {
                     "process list changed or contains an invalid pointer; retry the query".into(),
                 );
             }
-            let row = read_ranges(kernel_cr3, &[(current, self.process_bytes)])?;
-            let row = &row[0];
+            let row = read(kernel_cr3, current, self.process_bytes)?;
+            let row = row.as_slice();
             let pid = quad(row, self.pid_offset)?;
             let raw_name = bytes_at(row, self.name_offset, self.name_bytes)?;
             let end = raw_name
                 .iter()
                 .position(|byte| *byte == 0)
                 .unwrap_or(raw_name.len());
-            let name = String::from_utf8_lossy(&raw_name[..end]).into_owned();
-            let selected = numeric.map_or_else(
-                || name.eq_ignore_ascii_case(selector),
+            let mut name = String::from_utf8_lossy(&raw_name[..end]).into_owned();
+            let name_truncated = end >= raw_name.len().saturating_sub(1);
+            let needs_full_name = numeric.is_none() && name_truncated && selector.len() > end;
+            let mut selected = numeric.map_or_else(
+                || {
+                    if needs_full_name {
+                        selector
+                            .as_bytes()
+                            .get(..end)
+                            .is_some_and(|prefix| raw_name[..end].eq_ignore_ascii_case(prefix))
+                    } else {
+                        name.eq_ignore_ascii_case(selector)
+                    }
+                },
                 |wanted| pid == wanted,
             );
+            let mut validated_user_cr3 = None;
+            if selected && needs_full_name {
+                // ImageFileName is only a candidate filter when its buffer is full.
+                // Resolve prefix collisions using the complete PEB image basename.
+                let mut candidates = Vec::new();
+                if let Some(offset) = self.user_directory_offset {
+                    candidates.push(quad(row, offset)?);
+                }
+                candidates.push(quad(row, self.directory_offset)?);
+                candidates.push(target_cr3);
+                candidates.extend(crate::memory::cached_process_root([
+                    pid,
+                    quad(row, self.creation_offset)?,
+                    current,
+                    quad(row, self.peb_offset)?,
+                ]));
+                candidates.extend_from_slice(kernel_roots);
+                // Bind the PEB to this candidate's root before comparing the full name;
+                // another process can have the same PEB address and short-name prefix.
+                validated_user_cr3 = crate::memory::matched_root_with(
+                    &candidates,
+                    quad(row, self.peb_offset)?,
+                    &name,
+                    true,
+                    &mut |root, address, length| read(root, address, length).ok(),
+                )
+                .and_then(|root| {
+                    crate::memory::matched_root_with(
+                        &[root],
+                        quad(row, self.peb_offset).ok()?,
+                        selector,
+                        false,
+                        &mut |root, address, length| read(root, address, length).ok(),
+                    )
+                });
+                selected = validated_user_cr3.is_some();
+                if selected {
+                    name = selector.to_string();
+                }
+            }
             if selected {
                 if matched.is_some() {
                     return Err(format!(
@@ -768,6 +881,7 @@ impl KernelSymbols {
                 if target_cr3 != 0
                     && target_cr3 & !4095 != directory
                     && target_cr3 & !4095 != user_directory
+                    && validated_user_cr3 != Some(target_cr3 & !4095)
                 {
                     return Err(format!(
                         "CR3 does not belong to pid={pid} name={name}; kernel_cr3={directory:#x} user_cr3={user_directory:#x}"
@@ -776,8 +890,9 @@ impl KernelSymbols {
                 matched = Some(Process {
                     object: current,
                     pid,
+                    creation_time: quad(row, self.creation_offset)?,
                     name,
-                    name_truncated: end >= raw_name.len().saturating_sub(1),
+                    name_truncated: name_truncated && validated_user_cr3.is_none(),
                     kernel_cr3: directory,
                     user_cr3: user_directory,
                     peb: quad(row, self.peb_offset)?,
@@ -787,8 +902,12 @@ impl KernelSymbols {
                         .transpose()?
                         .unwrap_or(0)
                         != 0,
-                    validated_user_cr3: None,
-                    kernel_access_cr3: directory,
+                    validated_user_cr3,
+                    kernel_access_cr3: if validated_user_cr3.is_some() {
+                        kernel_cr3
+                    } else {
+                        directory
+                    },
                     observed_kernel_cr3: kernel_cr3,
                 });
                 if numeric.is_some() {
@@ -803,13 +922,41 @@ impl KernelSymbols {
                 return matched.ok_or_else(|| format!("process {selector} was not found"));
             }
             // Verify the next node's backlink before following a concurrently changing list.
-            let backlink = read_ranges(kernel_cr3, &[(next_link + 8, 8)])?;
-            if quad(&backlink[0], 0)? != current + self.links_offset as u64 {
+            let backlink = read(kernel_cr3, next_link + 8, 8)?;
+            if quad(&backlink, 0)? != current + self.links_offset as u64 {
                 return Err("process list changed during resolution; retry the query".into());
             }
             current = next;
         }
         Err("process list traversal exceeded its bounded query limit".into())
+    }
+
+    pub fn capture_identity(
+        &self,
+        process: &Process,
+    ) -> Result<([u64; 3], Vec<crate::memory::IdentityGuard>), String> {
+        if process.creation_time == 0 {
+            return Err("process has no stable creation identity".into());
+        }
+        let mut guards = Vec::new();
+        for (offset, expected) in [
+            (self.pid_offset, process.pid),
+            (self.creation_offset, process.creation_time),
+            (self.exit_offset, 0),
+            (self.peb_offset, process.peb),
+        ] {
+            let address = process
+                .object
+                .checked_add(offset as u64)
+                .ok_or("process identity address overflow")?;
+            guards.push(crate::memory::IdentityGuard {
+                cr3: process.observed_kernel_cr3,
+                address,
+                expected,
+                mask: u64::MAX,
+            });
+        }
+        Ok(([process.pid, process.creation_time, process.object], guards))
     }
 }
 

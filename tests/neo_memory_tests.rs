@@ -8,6 +8,49 @@ const IMAGE: u64 = 0x100000;
 const PARAMETERS: u64 = 0x30000;
 const PATH: u64 = 0x40000;
 
+#[test]
+fn persistent_root_hints_survive_history_eviction_and_reject_reused_identities() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "neo-root-cache-test-{}-{nonce}.bin",
+        std::process::id()
+    ));
+    let identity = [42, 123456, 0xffff_8000_0000_1000, PEB];
+    save_root_hint(&path, identity, ROOT).unwrap();
+    let cached = root_hint_at(&path, identity).unwrap();
+    assert_eq!(cached, ROOT);
+    // No root-history entry is needed, but the cached root still must map the live image.
+    let mut rows = fixture();
+    let validate = |rows: &BTreeMap<(u64, u64), Vec<u8>>| {
+        matched_root_with(
+            &[cached],
+            PEB,
+            "ExampleClient",
+            true,
+            &mut |root, address, length| read_fixture(rows, root, address, length),
+        )
+    };
+    assert_eq!(validate(&rows), Some(ROOT));
+    rows.get_mut(&(ROOT, IMAGE + 0x80)).unwrap()[4] = 0;
+    assert_eq!(validate(&rows), None);
+    for index in 0..identity.len() {
+        let mut reused = identity;
+        reused[index] += 1;
+        assert_eq!(root_hint_at(&path, reused), None);
+    }
+    assert!(save_root_hint(&path, identity, PROTECTED_ROOT).is_err());
+    assert!(save_root_hint(&path, [0; 4], ROOT).is_err());
+    let valid = std::fs::read(&path).unwrap();
+    for corrupted in [&valid[..47], &[0u8; 48][..], &[0u8; 49][..]] {
+        std::fs::write(&path, corrupted).unwrap();
+        assert_eq!(root_hint_at(&path, identity), None);
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
 fn fixture() -> BTreeMap<(u64, u64), Vec<u8>> {
     let mut rows = BTreeMap::new();
     let mut peb = vec![0; 0x28];

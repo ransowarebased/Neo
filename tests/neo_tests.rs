@@ -64,8 +64,8 @@ mod cpu_routing {
 
 mod transport {
     use crate::server::protocol::{
-        MAX_FRAME_SIZE, PROTOCOL_VERSION, ProtocolError, Request, RequestKind, Response,
-        read_request, read_response, write_request, write_response,
+        MAX_FRAME_SIZE, ProtocolError, Request, RequestKind, Response, read_request, read_response,
+        write_request, write_response,
     };
     use crate::server::{
         capture_stream, execute, handle_connection, valid_elf_update, validate_update_binary,
@@ -137,7 +137,7 @@ mod transport {
 
     fn header(kind: u16, payload_size: u32) -> Vec<u8> {
         let mut frame = b"ROAD".to_vec();
-        frame.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        frame.extend_from_slice(&crate::server::protocol::PROTOCOL_VERSION.to_le_bytes());
         frame.extend_from_slice(&kind.to_le_bytes());
         frame.extend_from_slice(&payload_size.to_le_bytes());
         frame.extend_from_slice(&42u64.to_le_bytes());
@@ -195,7 +195,7 @@ mod transport {
         }
         let binary = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         assert!(validate_update_binary(&binary).is_ok());
-        for length in [64, 128] {
+        for length in [64, 128, binary.len() / 2] {
             assert!(validate_update_binary(&binary[..length]).is_err());
         }
         let mut invalid = binary;
@@ -782,7 +782,7 @@ mod control_trace {
 
 #[test]
 fn ept_diagnostic_output_keeps_attempts_results_failure_context_and_pending_cpu_mask() {
-    use neo::protocol::memory::{
+    use crate::protocol::memory::{
         EPT_DIAGNOSTIC_SUBLEAF, EPT_SYNC_DIAGNOSTIC_WORDS, INTERCEPT_DIAGNOSTIC_WORDS,
     };
     let mut words = [0u64; INTERCEPT_DIAGNOSTIC_WORDS + EPT_SYNC_DIAGNOSTIC_WORDS + 8];

@@ -111,6 +111,89 @@ fn context(offset: u64) -> UnwindContext {
 }
 
 #[test]
+fn live_and_captured_unwind_support_large_static_tables_without_bulk_reads() {
+    let count = 782_976u32;
+    let table_rva = 0x0200_0000u32;
+    let mut entries = vec![0; count as usize * 12];
+    for index in 0..count {
+        let offset = index as usize * 12;
+        let begin = 0x1000 + index * 16;
+        put32(&mut entries, offset, begin);
+        put32(&mut entries, offset + 4, begin + 16);
+        put32(&mut entries, offset + 8, 0x100);
+    }
+    let begin = 0x1000 + (count - 1) * 16;
+    let mut image = module();
+    image.size = 0x0300_0000;
+    image.exception_rva = table_rva;
+    image.exception_size = count * 12;
+    image.sections[0].size = begin + 16 - 0x1000;
+    let mut memory = Memory::default();
+    memory.regions.insert(BASE + u64::from(table_rva), entries);
+    memory.regions.insert(BASE + 0x100, vec![1, 0, 0, 0]);
+    memory
+        .regions
+        .insert(BASE + u64::from(begin), vec![0x90; 16]);
+    memory.regions.insert(STACK, vec![0; 16]);
+    for captured in [false, true] {
+        memory.reads = 0;
+        let result = neo::unwind::unwind_with_tables(
+            &mut |address, length| {
+                let unused_page = BASE + u64::from(table_rva) + 4096;
+                if address < unused_page + 4096 && address + length as u64 > unused_page {
+                    return Err("PARTIAL_TRANSFER: unrelated table page is not resident".into());
+                }
+                memory.read(address, length)
+            },
+            std::slice::from_ref(&image),
+            &[],
+            context(u64::from(begin) + 4),
+            8,
+            captured,
+        );
+        assert!(result.complete, "{}", result.stop);
+        assert_eq!(result.frames[0].method, "pdata");
+        assert!(memory.reads < 40, "large tables must use sparse lookup");
+    }
+    let unavailable = unwind(
+        &mut |address, length| {
+            if address >= BASE + u64::from(table_rva) {
+                Err("PARTIAL_TRANSFER: required table page is not resident".into())
+            } else {
+                memory.read(address, length)
+            }
+        },
+        std::slice::from_ref(&image),
+        context(u64::from(begin) + 4),
+        8,
+    );
+    assert!(!unavailable.complete);
+    assert!(unavailable.stop.contains("PARTIAL_TRANSFER"));
+
+    image.exception_size += 1;
+    let malformed = neo::unwind::unwind_with_tables(
+        &mut memory,
+        std::slice::from_ref(&image),
+        &[],
+        context(u64::from(begin) + 4),
+        8,
+        true,
+    );
+    assert!(!malformed.complete);
+    image.exception_size = count * 12;
+    image.size = table_rva + image.exception_size - 1;
+    let outside_image = neo::unwind::unwind_with_tables(
+        &mut memory,
+        &[image],
+        &[],
+        context(u64::from(begin) + 4),
+        8,
+        true,
+    );
+    assert!(!outside_image.complete);
+}
+
+#[test]
 fn cpuid_wire_records_have_reserved_padding_and_optional_debug_gate() {
     let mut request = InterceptionRequest {
         operation: CPUID_SET,
@@ -271,6 +354,39 @@ fn pe_exports_sections_forwarders_and_symbolic_addresses_are_resolved() {
     assert!(user::resolve_address(&modules, "sample!foo").is_err());
     assert!(user::resolve_address(&modules, "sample+0xffff").is_err());
     assert!(memory.reads < 30);
+}
+
+#[test]
+fn suspended_loader_state_is_distinct_from_corruption_and_an_initialized_empty_list() {
+    let mut memory = Memory::default();
+    memory.regions.insert(0x200000, vec![0; 0x1000]);
+    assert!(
+        user::initialized_modules(&mut memory, 0x200000)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        user::modules(&mut memory, 0x200000).unwrap_err(),
+        "loader is not initialized"
+    );
+    put64(memory.regions.get_mut(&0x200000).unwrap(), 0x18, 0x200101);
+    assert!(
+        user::initialized_modules(&mut memory, 0x200000)
+            .unwrap_err()
+            .contains("invalid native x64 loader")
+    );
+    let loader = memory.regions.get_mut(&0x200000).unwrap();
+    put64(loader, 0x18, 0x200100);
+    put64(loader, 0x120, 0x200120);
+    put64(loader, 0x128, 0x200120);
+    assert!(
+        user::initialized_modules(&mut memory, 0x200000)
+            .unwrap()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(user::initialized_modules(&mut memory, 0).is_err());
+    assert!(user::initialized_modules(&mut memory, 0x300000).is_err());
 }
 
 #[test]
