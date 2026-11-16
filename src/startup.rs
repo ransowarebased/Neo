@@ -99,7 +99,7 @@ fn print_help() {
         "  status                            - Query hypervisor state and diagnostics",
         "  read PID|NAME CR3|auto [ADDRESS SIZE ...] - Read a memory batch or resolve a process",
         "  write PID|NAME CR3|auto ADDRESS HEX [...] - Write a memory batch",
-        "  hook install CR3 ADDRESS HEX [...] [--alternate-cr3 CR3] [--vmfunc] [--concurrent-writes] [--persistent-data] [--lease-ms MS | --no-lease] [--tsc-offset] - Install split views",
+        "  hook install CR3 ADDRESS HEX [...] [--alternate-cr3 CR3] [--vmfunc] [--concurrent-writes] [--persistent-data] [--lease-ms MS | --no-lease] - Install split views",
         "  hook add TOKEN ADDRESS HEX [...] | hook remove TOKEN [ID] | hook list TOKEN - Change individual patches",
         "  hook context-add TOKEN CR3 [...] | hook context-remove TOKEN CR3 [...] | hook context-list TOKEN - Manage validated CR3 aliases",
         "  hook renew TOKEN [--lease-ms MS] | hook watch TOKEN [--lease-ms MS] | hook release TOKEN | hook status - Manage the lease",

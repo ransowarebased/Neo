@@ -82,7 +82,7 @@ pub(crate) fn append_ept_diagnostics(
         *values = [first, second];
     }
     let phases = [
-        "dispatch", "apply", "revoke", "flush", "observe", "timing", "recovery",
+        "dispatch", "apply", "revoke", "flush", "observe", "reserved", "recovery",
     ];
     for (index, phase) in phases.iter().enumerate() {
         for (result, value) in ["attempts", "successes", "failures"]

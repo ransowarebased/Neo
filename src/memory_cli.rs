@@ -61,8 +61,6 @@ pub(crate) fn interception_json(bytes: &[u8]) -> Result<Value, String> {
         "persistent_data": word(bytes, 128) & INTERCEPT_PERSISTENT_DATA != 0,
         "private_shared_data": word(bytes, 128) & INTERCEPT_PRIVATE_SHARED_DATA != 0,
         "cpuid_records": word(bytes, 24),
-        "tsc_offset": word(bytes, 128) & INTERCEPT_TSC_OFFSET != 0,
-        "compensated_ticks": output::hex(quad(bytes, 72)),
         "vmfunc": word(bytes, 128) & INTERCEPT_VMFUNC != 0,
         "execute_slot": INTERCEPT_EXECUTE_SLOT, "data_slot": INTERCEPT_DATA_SLOT
     });
@@ -200,12 +198,6 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
             modes |= flag;
         }
     }
-    let timing = if let Some(index) = arguments.iter().position(|value| value == "--tsc-offset") {
-        arguments.remove(index);
-        true
-    } else {
-        false
-    };
     let mut lease_ms = 0;
     if let Some(index) = arguments.iter().position(|value| value == "--lease-ms") {
         if index + 1 >= arguments.len() {
@@ -235,7 +227,7 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
         (Some("debug-registers"), Some("set")) => DEBUG_SET,
         (Some("debug-registers"), Some("clear")) => DEBUG_CLEAR,
         (Some("hook" | "debug-registers"), Some("status")) => INTERCEPT_STATUS,
-        _ => return Err("usage: neo hook install CR3 ADDRESS HEX [...] [--alternate-cr3 CR3] [--vmfunc] [--concurrent-writes] [--persistent-data] [--lease-ms MS | --no-lease] [--tsc-offset] | hook add TOKEN ADDRESS HEX [...] | hook remove TOKEN [ID] | hook list TOKEN | hook context-add TOKEN CR3 [...] | hook context-remove TOKEN CR3 [...] | hook context-list TOKEN | hook renew TOKEN [--lease-ms MS] | hook release TOKEN | hook watch TOKEN [--lease-ms MS] | hook status; neo debug-registers set CR3 ADDRESS REDIRECT_RIP [...] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset] | debug-registers clear TOKEN | debug-registers status".into()),
+        _ => return Err("usage: neo hook install CR3 ADDRESS HEX [...] [--alternate-cr3 CR3] [--vmfunc] [--concurrent-writes] [--persistent-data] [--lease-ms MS | --no-lease] | hook add TOKEN ADDRESS HEX [...] | hook remove TOKEN [ID] | hook list TOKEN | hook context-add TOKEN CR3 [...] | hook context-remove TOKEN CR3 [...] | hook context-list TOKEN | hook renew TOKEN [--lease-ms MS] | hook release TOKEN | hook watch TOKEN [--lease-ms MS] | hook status; neo debug-registers set CR3 ADDRESS REDIRECT_RIP [...] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] | debug-registers clear TOKEN | debug-registers status".into()),
     };
     if operation == INTERCEPT_STATUS && arguments.len() != 2
         || matches!(
@@ -256,9 +248,6 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
     if no_lease && (lease_ms != 0 || !matches!(operation, HOOK_INSTALL | DEBUG_SET)) {
         return Err("--no-lease applies only to installation or debug setup and cannot be combined with --lease-ms".into());
     }
-    if timing && !matches!(operation, HOOK_INSTALL | DEBUG_SET) {
-        return Err("--tsc-offset applies only to hook installation or debug setup".into());
-    }
     if modes != 0 && operation != HOOK_INSTALL {
         return Err("data-view modes apply only to hook installation".into());
     }
@@ -273,9 +262,6 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
     }
     if no_lease {
         request.flags |= crate::protocol::memory::INTERCEPT_NO_LEASE;
-    }
-    if timing {
-        request.flags |= crate::protocol::memory::INTERCEPT_TSC_OFFSET;
     }
     if matches!(operation, INTERCEPT_CONTEXT_ADD | INTERCEPT_CONTEXT_REMOVE) {
         if arguments.len() < 4 || arguments.len() > ROOT_HISTORY_COUNT + 1 {
@@ -369,8 +355,8 @@ pub(crate) fn cpuid_packet(arguments: &[String]) -> Result<Vec<u8>, String> {
                         values: values[3..7].try_into().map_err(|_| "invalid register values")?,
                         keep_masks: values[7..11].try_into().map_err(|_| "invalid keep masks")? });
                     index += 12;
-                } else if matches!(option, "--no-lease" | "--tsc-offset") {
-                    request.flags |= if option == "--no-lease" { INTERCEPT_NO_LEASE } else { INTERCEPT_TSC_OFFSET };
+                } else if option == "--no-lease" {
+                    request.flags |= INTERCEPT_NO_LEASE;
                     index += 1;
                 } else {
                     let value = number(arguments.get(index + 1).ok_or_else(|| format!("{option} requires a value"))?)?;
@@ -395,7 +381,7 @@ pub(crate) fn cpuid_packet(arguments: &[String]) -> Result<Vec<u8>, String> {
                 _ => return Err("CPUID gating requires --dr3, --dr7-mask and --dr7-value together".into()),
             };
         }
-        _ => return Err("usage: neo cpuid set CR3 [--token TOKEN] --record LEAF SUBLEAF MASK EAX EBX ECX EDX KEEP_EAX KEEP_EBX KEEP_ECX KEEP_EDX [...] [--dr3 ADDRESS --dr7-mask MASK --dr7-value VALUE] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset]; cpuid clear TOKEN; cpuid status".into()),
+        _ => return Err("usage: neo cpuid set CR3 [--token TOKEN] --record LEAF SUBLEAF MASK EAX EBX ECX EDX KEEP_EAX KEEP_EBX KEEP_ECX KEEP_EDX [...] [--dr3 ADDRESS --dr7-mask MASK --dr7-value VALUE] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease]; cpuid clear TOKEN; cpuid status".into()),
     }
     neo::memory::interception_packet(&request)
 }
@@ -748,12 +734,6 @@ pub(crate) fn run_interception(arguments: &[String]) -> Result<i32, String> {
     );
     if word(&bytes, 128) & crate::protocol::memory::INTERCEPT_NO_LEASE != 0 {
         println!("lease=disabled lifetime=explicit-release");
-    }
-    if word(&bytes, 128) & crate::protocol::memory::INTERCEPT_TSC_OFFSET != 0 {
-        println!(
-            "timing=cr3-scoped-virtual-tsc compensated_ticks={} reference_tsc=unsupported",
-            quad(&bytes, 72)
-        );
     }
     println!(
         "contexts={} concurrent_writes={} persistent_data={}",

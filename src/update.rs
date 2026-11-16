@@ -12,6 +12,7 @@ pub const STATE_ABI_DEBUGGER: u32 = 5;
 pub const STATE_ABI_EXTENDED_HOOKS: u32 = 6;
 pub const STATE_ABI_EXTENDED_CAPTURE: u32 = 7;
 pub const STATE_ABI_HOST_STACK: u32 = 8;
+pub const STATE_ABI_UNCOMPENSATED_TSC: u32 = 9;
 pub const HEADER_BYTES: usize = 256;
 pub const BANK_BYTES: usize = 256 * 1024;
 pub const BANK_PAGES: usize = BANK_BYTES / 4096;
@@ -45,6 +46,7 @@ pub const fn supports_state_abi(state_abi: u32) -> bool {
             | STATE_ABI_EXTENDED_HOOKS
             | STATE_ABI_EXTENDED_CAPTURE
             | STATE_ABI_HOST_STACK
+            | STATE_ABI_UNCOMPENSATED_TSC
     )
 }
 

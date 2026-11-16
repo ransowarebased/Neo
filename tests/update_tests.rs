@@ -116,6 +116,7 @@ fn preflight_accepts_only_matching_supported_resident_state_versions() {
         STATE_ABI_EXTENDED_HOOKS,
         STATE_ABI_EXTENDED_CAPTURE,
         STATE_ABI_HOST_STACK,
+        STATE_ABI_UNCOMPENSATED_TSC,
     ] {
         let (mut bytes, abi, key) = package(2);
         bytes[28..32].copy_from_slice(&state_abi.to_le_bytes());
@@ -133,7 +134,7 @@ fn preflight_accepts_only_matching_supported_resident_state_versions() {
             Error::Abi
         );
         assert_eq!(
-            Package::parse_for_state(&bytes, abi, &key, 9).unwrap_err(),
+            Package::parse_for_state(&bytes, abi, &key, 10).unwrap_err(),
             Error::Abi
         );
         if state_abi == STATE_ABI {
@@ -158,7 +159,7 @@ fn preflight_accepts_only_matching_supported_resident_state_versions() {
         );
     }
     assert!(!supports_state_abi(0));
-    assert!(!supports_state_abi(9));
+    assert!(!supports_state_abi(10));
 }
 
 #[test]
