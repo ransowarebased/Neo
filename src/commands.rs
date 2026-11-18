@@ -51,14 +51,12 @@ struct RemoteStatus {
 }
 
 pub fn run(mut arguments: Vec<String>) -> Result<i32, String> {
-    output::begin(&mut arguments);
-    if output::is_json()
-        && arguments
-            .iter()
-            .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
-        && !arguments.iter().any(|argument| argument == "exec")
-    {
-        return Err("--json requires a command result; use --help without --json".into());
+    if output::begin(&mut arguments) {
+        if output::is_json() {
+            return Err("--json requires a command result; use --help without --json".into());
+        }
+        print_usage();
+        return Ok(0);
     }
     if let Some((arguments, remote, timeout, timeout_ms)) = memory_options(&arguments)? {
         if let Some(remote) = remote {
@@ -142,7 +140,7 @@ fn memory_options(arguments: &[String]) -> Result<Option<MemoryOptions>, String>
                 .get(index + 1)
                 .ok_or_else(|| format!("{option} requires a value"))?;
             match option.as_str() {
-                "--remote" => remote = Some(value.clone()),
+                "--remote" => remote = Some(remote_address(Some(value))?),
                 "--timeout" => {
                     timeout = Duration::from_secs(parse_duration(value, "--timeout", 3600)?);
                     timeout_given = true;
@@ -218,6 +216,18 @@ fn parse_duration(value: &str, option: &str, maximum: u64) -> Result<u64, String
         .ok()
         .filter(|value| (1..=maximum).contains(value))
         .ok_or_else(|| format!("{option} must be an integer in 1..={maximum}"))
+}
+
+fn remote_address(value: Option<&String>) -> Result<String, String> {
+    value
+        .filter(|value| !value.starts_with('-'))
+        .filter(|value| {
+            value
+                .rsplit_once(':')
+                .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+        })
+        .cloned()
+        .ok_or_else(|| "--remote requires ADDRESS:PORT".into())
 }
 
 fn run_memory(arguments: &[String]) -> Result<i32, String> {
@@ -869,12 +879,7 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
         match arguments[index].as_str() {
             "--remote" => {
                 index += 1;
-                remote = Some(
-                    arguments
-                        .get(index)
-                        .ok_or_else(|| "--remote requires ADDRESS:PORT".to_string())?
-                        .clone(),
-                );
+                remote = Some(remote_address(arguments.get(index))?);
             }
             "--timeout" => {
                 index += 1;
@@ -1182,7 +1187,7 @@ fn print_usage() {
         "neo session set CR3|auto TOKEN --process PID|NAME --instruction ADDRESS|MODULE+RVA [--arg-reg REG[+OFFSET|-OFFSET] BYTES DEPTH] [--arg-stack OFFSET BYTES DEPTH] [--region ADDRESS BYTES] [--stack-bytes 1..2048] [--code-pages] [--snapshot-arm] [--snapshot-after] [--max-events COUNT | --circular] [--lease-ms MS]\nneo session status [TOKEN] | session fetch TOKEN CPU CURSOR COUNT\nneo session compare FILE.jsonl CPU:SEQUENCE CPU:SEQUENCE\nneo session export FILE.jsonl --output DIRECTORY\nInstruction capture runs before the instruction using a hardware execution trap. Its default is one hit. Argument depth 0 captures a scalar (BYTES=0); depth 1 copies its pointee; depth 2 follows another pointer. Regions accept up to 4096 bytes each; regions and arguments share twelve slots. Depth 1 copies at REG+OFFSET; depth 2 follows the pointer at REG+OFFSET. Offsets are signed 16-bit values. Snapshots contain per-page read status, mapping identity and effective guest permissions. Other threads can continue running, so these are not atomic snapshots of the whole process. The after snapshot uses MTF after the original instruction; ARM has process context without target register values. Comparison, SHA-256, symbols, unwind and binary export run in Neo."
     );
     println!(
-        "neo cpuid set CR3 [--token TOKEN] --record LEAF SUBLEAF MASK EAX EBX ECX EDX KEEP_EAX KEEP_EBX KEEP_ECX KEEP_EDX [--record ...] [--dr3 ADDRESS --dr7-mask MASK --dr7-value VALUE] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease]\nneo cpuid clear TOKEN | cpuid status\nneo memmap PID|NAME CR3|auto [--resident] [--output PATH]\nneo modules PID|NAME CR3|auto [--sections] [--exports] [--output PATH]\nneo scan PID|NAME CR3|auto --pattern \"48 8B ??\" [--start ADDRESS --end ADDRESS] [--max-hits COUNT] [--disasm] [--output PATH]\nneo disasm PID|NAME CR3|auto ADDRESS SIZE [--output PATH]\nneo read PID|NAME CR3|auto ADDRESS SIZE [--disasm]\nneo watch|context filter TOKEN [--thread-teb TEB] [--rip-include START END] [--rip-exclude START END]\nneo watch fetch TOKEN CPU CURSOR COUNT [--process PID|NAME] [--disasm] [--unwind]\nneo context snapshot TOKEN CPU CURSOR COUNT [--process PID|NAME] [--disasm] [--unwind]\nneo context stack TOKEN CPU SEQUENCE COUNT --unwind [--process PID|NAME]\nneo session set CR3 TOKEN [--sample] [--exceptions MASK] [--region ADDRESS SIZE ...] [--entry ADDRESS --return ADDRESS ...] [--exception-dispatch ADDRESS] [--no-lease | --lease-ms MS]\nneo session clear TOKEN\nneo session record TOKEN --output FILE.jsonl [--seconds N] [--interval-ms N] [--cpu CPU] [--process PID|NAME] [--disasm] [--unwind]\nneo watch record TOKEN --output FILE.jsonl [--seconds N] [--interval-ms N] [--cpu CPU] [--process PID|NAME] [--disasm] [--unwind]\nneo session query FILE.jsonl [--kind KIND] [--cpu CPU] [--sequence N] [--thread-teb TEB] [--invocation ID] [--limit N] [--disasm] [--unwind]\nneo session tree FILE.jsonl [--thread-teb TEB]\nUnwind options include --frames N, --dynamic-list HEAD, and repeatable --table BASE START END ADDRESS COUNT (sorted AMD64 runtime functions). Capture code, function tables and unwind metadata with --region for offline analysis.\nAnalysis accepts --kernel-cr3 CR3 --kernel-image PATH --symbols DIRECTORY, --json and --remote HOST:PORT. Paths refer to the target host.\nADDRESS accepts integers, module!export (including forwarded exports and #ordinals), and module+offset. Symbolic interception addresses require --process PID|NAME.\n--private-shared-data requires a full 4096-byte hook patch at 0x7ffe0000 and a lease; VMFUNC, concurrent writes, persistent data and data-shadow on that page are incompatible.\nCPUID gates are optional on updated hypervisors; specify all three DR options to enable gating. Keep masks preserve native bits before replacement values are ORed.\nFilters use exclusive range ends, exclusions win, and an empty filter clears restrictions. Filters persist within the session and affect future captures. Watch RIP is post-instruction.\nEvent snapshots retain 32 instruction bytes, up to 2048 stack bytes and four selected regions of up to 4096 bytes each. Peer CPUs can still modify shared memory during the VM exit. Paired entry/return probes require the caller continuation address after CALL; --instruction probes accept a single instruction address. They share the four debug slots with watchpoints and redirects. Hardware exceptions use a bit mask by x86 vector. --exception-dispatch accepts the address of native AMD64 RtlDispatchException and records the dispatched Windows exception. AMD64 unwind supports version 1 PE and dynamic tables. A missing snapshot range stops unwind with a partial stack. Legacy context stack on older EFI uses live reads and labels them accordingly.\n"
+        "neo cpuid set CR3 [--token TOKEN] --record LEAF SUBLEAF MASK EAX EBX ECX EDX KEEP_EAX KEEP_EBX KEEP_ECX KEEP_EDX [--record ...] [--dr3 ADDRESS --dr7-mask MASK --dr7-value VALUE] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease]\nneo cpuid clear TOKEN | cpuid status\nneo memmap PID|NAME CR3|auto [--resident] [--output PATH]\nneo modules PID|NAME CR3|auto [--sections] [--exports] [--output PATH]\nneo scan PID|NAME CR3|auto --pattern \"48 8B ??\" [--start ADDRESS --end ADDRESS] [--max-hits COUNT] [--disasm] [--output PATH]\nneo disasm PID|NAME CR3|auto ADDRESS SIZE [--output PATH]\nneo read PID|NAME CR3|auto ADDRESS SIZE [--disasm]\nneo watch|context filter TOKEN [--thread-teb TEB] [--rip-include START END] [--rip-exclude START END]\nneo watch fetch TOKEN CPU CURSOR COUNT [--process PID|NAME] [--disasm] [--unwind]\nneo context snapshot TOKEN CPU CURSOR COUNT [--process PID|NAME] [--disasm] [--unwind]\nneo context stack TOKEN CPU SEQUENCE COUNT --unwind [--process PID|NAME]\nneo session set CR3 TOKEN [--sample] [--exceptions MASK] [--region ADDRESS SIZE ...] [--entry ADDRESS --return ADDRESS ...] [--exception-dispatch ADDRESS] [--no-lease | --lease-ms MS]\nneo session clear TOKEN\nneo session record TOKEN --output FILE.jsonl [--seconds N] [--interval-ms N] [--cpu CPU] [--process PID|NAME] [--disasm] [--unwind]\nneo watch record TOKEN --output FILE.jsonl [--seconds N] [--interval-ms N] [--cpu CPU] [--process PID|NAME] [--disasm] [--unwind]\nneo session query FILE.jsonl [--kind KIND] [--cpu CPU] [--sequence N] [--thread-teb TEB] [--invocation ID] [--limit N] [--disasm] [--unwind]\nneo session tree FILE.jsonl [--thread-teb TEB]\nUnwind options include --frames N, --dynamic-list HEAD, and repeatable --table BASE START END ADDRESS COUNT (sorted AMD64 runtime functions). Capture code, function tables and unwind metadata with --region for offline analysis.\nAnalysis accepts --kernel-cr3 CR3 --kernel-image PATH --symbols DIRECTORY, --json and --remote HOST:PORT. Paths refer to the target host.\nADDRESS accepts integers, module!export (including forwarded exports and #ordinals), and module+offset. Symbolic interception addresses require --process PID|NAME.\n--private-shared-data requires a full 4096-byte hook patch at 0x7ffe0000 and a lease; VMFUNC, concurrent writes, persistent data and data-shadow on that page are incompatible.\nCPUID gates are optional on updated hypervisors; specify all three DR options to enable gating. Keep masks preserve native bits before replacement values are ORed.\nFilters use exclusive range ends, exclusions win, and an empty filter clears restrictions. Filters persist within the session and affect future captures. Watch RIP is post-instruction.\nEvent snapshots retain 32 instruction bytes, up to 2048 stack bytes and four selected regions of up to 4096 bytes each. Peer CPUs can still modify shared memory during the VM exit. Paired entry/return probes require the caller continuation address after CALL; --instruction probes accept a single instruction address. They share the four debug slots with watchpoints and redirects. Hardware exceptions use a bit mask by x86 vector. --exception-dispatch accepts the address of native AMD64 RtlDispatchException and records the dispatched Windows exception. AMD64 unwind supports version 1 and 2 metadata in PE and dynamic tables. A missing snapshot range stops unwind with a partial stack. Legacy context stack on older EFI uses live reads and labels them accordingly.\n"
     );
     println!(
         "Use --json with status, ping, telemetry, PT, memory, startup, update, or remote exec. JSON results use {{\"ok\":true,\"data\":...}} or {{\"ok\":false,\"error\":{{\"code\":...,\"message\":...,\"retryable\":...}}}}. All u64 values use fixed-width hexadecimal strings. Telemetry emits one JSON object per sample (JSONL), including --output files. Memory commands accept --remote ADDRESS:PORT; paths refer to the remote host. Use --exec-timeout-ms 1..3600000 before exec, or anywhere with remote memory commands (default 290000 ms). The server terminates the process tree on timeout. Socket waits allow the execution deadline plus cleanup time.\n"

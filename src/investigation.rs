@@ -54,12 +54,12 @@ fn module_identity(reader: &mut impl user::MemoryReader, module: &Module) -> Res
     if number(&nt, 132)? >= 7 {
         let directory = number(&nt, 136 + 6 * 8)?;
         let length = number(&nt, 140 + 6 * 8)? as usize;
-        if length > 128 * 28 || length % 28 != 0 {
+        if length > 128 * 28 || !length.is_multiple_of(28) {
             return Err("module debug directory exceeds its bound".into());
         }
         if length != 0 {
             let debug = user::read_exact(reader, module.address(directory, length)?, length)?;
-            for row in debug.chunks_exact(28) {
+            for row in debug.as_chunks::<28>().0 {
                 if number(row, 12)? != 2 {
                     continue;
                 }
@@ -173,7 +173,10 @@ pub(crate) fn decode(record: &[u8]) -> Result<Value, String> {
         let mut pages = Vec::new();
         let mut next_offset = 0;
         let mut total = 0;
-        for descriptor in segment[64..EVENT_SEGMENT_HEADER].chunks_exact(EVENT_PAGE_BYTES) {
+        for descriptor in segment[64..EVENT_SEGMENT_HEADER]
+            .as_chunks::<EVENT_PAGE_BYTES>()
+            .0
+        {
             let page_requested = word(descriptor, 24);
             if page_requested == 0 {
                 continue;
@@ -326,7 +329,9 @@ impl Snapshot {
             let bytes = segment
                 .bytes
                 .as_bytes()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     std::str::from_utf8(pair)
                         .ok()
@@ -445,7 +450,7 @@ impl Analysis {
             event["instructions"] = analysis_cli::instructions_json(&user::disassemble(
                 &self.catalog.modules,
                 rip,
-                &snapshot.0[0].1,
+                &user::MemoryReader::read(&mut snapshot, rip, EVENT_CODE_BYTES).unwrap_or_default(),
                 8,
             ));
         }
@@ -661,13 +666,8 @@ pub(crate) fn attach(
             EVENT_CONTEXT
         },
     )?;
-    let process = records
-        .first()
-        .map(|record| field(record, "cr3"))
-        .transpose()?
-        .map(|root| analysis.load_catalog(options, root))
-        .transpose()?
-        .flatten();
+    let mut process = None;
+    let mut catalog_errors = std::collections::HashMap::new();
     for record in records {
         let Some(mut event) = captured
             .iter()
@@ -682,8 +682,22 @@ pub(crate) fn attach(
                 json!("event bytes are outside the retained snapshot window");
             continue;
         };
-        let root = field(record, "cr3")?;
-        if process.is_some_and(|(kernel, user)| root & !4095 != kernel && root & !4095 != user) {
+        let root = field(record, "cr3")? & !4095;
+        if process.is_none() && options.selector.is_some() {
+            if let std::collections::hash_map::Entry::Vacant(entry) = catalog_errors.entry(root) {
+                match analysis.load_catalog(options, root) {
+                    Ok(resolved) => process = resolved,
+                    Err(error) => {
+                        entry.insert(error);
+                    }
+                }
+            }
+            if let Some(error) = catalog_errors.get(&root) {
+                record["analysis_error"] = json!(error);
+                continue;
+            }
+        }
+        if process.is_some_and(|(kernel, user)| root != kernel && root != user) {
             record["analysis_error"] =
                 json!("captured CR3 does not belong to the selected process");
             continue;
@@ -903,14 +917,17 @@ fn setup(arguments: &mut Vec<String>) -> Result<i32, String> {
         memory::number(cr3)?
     };
     setup.token = memory::number(token)?;
-    if !circular
-        && setup.event_limit == 0
-        && probes.iter().any(|(_, kind)| *kind == EVENT_INSTRUCTION)
-    {
+    let instruction_capture = probes.iter().any(|(_, kind)| *kind == EVENT_INSTRUCTION);
+    if !circular && setup.event_limit == 0 && instruction_capture {
         setup.event_limit = 1;
     }
-    if probes.iter().any(|(_, kind)| *kind == EVENT_INSTRUCTION) && options.selector.is_none() {
-        return Err("instruction capture requires --process PID|NAME to validate the process execution identity".into());
+    if instruction_capture {
+        if no_lease {
+            return Err("instruction capture requires a lease; remove --no-lease".into());
+        }
+        if options.selector.is_none() {
+            return Err("instruction capture requires --process PID|NAME to validate the process execution identity".into());
+        }
     }
     if setup.token != 0 {
         let status = request(InterceptionRequest {
@@ -923,7 +940,7 @@ fn setup(arguments: &mut Vec<String>) -> Result<i32, String> {
         }
         if !no_lease && setup.lease_ms == 0 {
             setup.lease_ms = word(&status, 132);
-            if setup.lease_ms == 0 {
+            if setup.lease_ms == 0 && !instruction_capture {
                 setup.flags |= INTERCEPT_NO_LEASE;
             }
         }
@@ -1482,7 +1499,9 @@ pub(crate) fn export(mut arguments: Vec<String>) -> Result<i32, String> {
             let bytes = segment
                 .bytes
                 .as_bytes()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     u8::from_str_radix(
                         std::str::from_utf8(pair).map_err(|error| error.to_string())?,

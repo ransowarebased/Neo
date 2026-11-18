@@ -109,6 +109,33 @@ fn module_catalog_retains_binary_identity_and_unwind_directory_from_loaded_pe_he
 fn put64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
+
+#[test]
+fn disassembly_joins_instruction_bytes_across_snapshot_pages() {
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+
+    let mut captured = event(1);
+    let rip = 0x40_1fff;
+    captured["context"]["rip"] = json!(crate::output::hex(rip));
+    let page = |index: usize, byte: u8| {
+        let address = crate::output::hex(rip + index as u64);
+        json!({ "address": address, "physical": address, "pte_fingerprint": "0x0",
+            "requested": 1, "copied": 1, "status": 0, "permissions": 5,
+            "offset": index, "page_size": 4096,
+            "sha256": crate::analysis_cli::hex_bytes(&Sha256::digest([byte])) })
+    };
+    captured["segments"][0] = json!({
+        "address": crate::output::hex(rip), "requested": 2, "copied": 2, "status": 0,
+        "bytes": "6690", "pages": [page(0, 0x66), page(1, 0x90)],
+    });
+    let analysis = super::Analysis {
+        disasm: true,
+        ..Default::default()
+    };
+    analysis.apply(&mut captured).unwrap();
+    assert_eq!(captured["instructions"].as_array().unwrap().len(), 1);
+}
 fn put32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }

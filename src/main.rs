@@ -10,7 +10,6 @@ use neo::protocol;
 mod server;
 mod startup;
 mod telemetry;
-pub mod update;
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -49,9 +48,6 @@ mod json_tests;
 #[cfg(test)]
 #[path = "../tests/neo_tests.rs"]
 mod tests;
-#[cfg(test)]
-#[path = "../tests/update_tests.rs"]
-mod update_tests;
 
 #[cfg(test)]
 #[path = "../../MatrixHV/tests/memory_tests.rs"]

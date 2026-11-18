@@ -246,6 +246,12 @@ fn resident_batches_allow_streaming_beyond_tracking_capacity_and_reject_bad_curs
     put64(&mut bytes, 16, 0x400000);
     assert!(decode_page_batch(&bytes, 0x2000, 0x400000).is_err());
     assert!(decode_page_batch(&bytes[..100], 0x2000, 0).is_err());
+    let limit = 1 << 47;
+    put64(&mut bytes, 16, limit);
+    put32(&mut bytes, 32, 0);
+    let end = decode_page_batch(&bytes, 0x2000, limit).unwrap();
+    assert_eq!(end.next, limit);
+    assert!(end.pages.is_empty());
 }
 
 #[test]
@@ -461,6 +467,140 @@ fn epilog_simulation_uses_the_current_stack_instead_of_undoing_the_prolog_twice(
 }
 
 #[test]
+fn caller_frames_use_return_address_metadata_even_when_its_code_was_not_captured() {
+    let (mut memory, mut module) = unwind_fixture(&[4, 0x42], 4, 0);
+    module.exception_size = 24;
+    let image = memory.regions.get_mut(&BASE).unwrap();
+    put32(image, 0x300c, 0x1200);
+    put32(image, 0x3010, 0x1300);
+    put32(image, 0x3014, 0x3200);
+    image[0x3200..0x3206].copy_from_slice(&[1, 4, 1, 0, 4, 0x42]);
+    image[0x1280..0x1285].copy_from_slice(&[0x48, 0x83, 0xc4, 8, 0xc3]);
+    let stack = memory.regions.get_mut(&STACK).unwrap();
+    put64(stack, 40, BASE + 0x1280);
+    put64(stack, 88, BASE + 0x1400);
+    for sparse in [false, true] {
+        if sparse {
+            let image = memory.regions.remove(&BASE).unwrap();
+            memory
+                .regions
+                .insert(BASE + 0x1000, image[0x1000..0x1100].to_vec());
+            memory
+                .regions
+                .insert(BASE + 0x3000, image[0x3000..0x3300].to_vec());
+        }
+        let result = unwind(
+            &mut memory,
+            std::slice::from_ref(&module),
+            context(0x1020),
+            8,
+        );
+        assert!(result.complete, "{}", result.stop);
+        assert_eq!(result.frames.len(), 3);
+        assert_eq!(result.frames[1].method, "pdata");
+        assert_eq!(result.frames[2].rsp, STACK + 96);
+    }
+}
+
+#[test]
+fn version_two_epilogs_unwind_from_the_remaining_pops_without_code_bytes() {
+    let codes = [4, 0x16, 0x30, 6, 6, 0x32, 4, 0xc0, 2, 0x10];
+    let (mut memory, module) = unwind_fixture(&codes, 6, 0);
+    let mut image = memory.regions.remove(&BASE).unwrap();
+    image[0x3100] = 2;
+    memory
+        .regions
+        .insert(BASE + 0x3000, image[0x3000..0x3300].to_vec());
+    put64(memory.regions.get_mut(&STACK).unwrap(), 16, BASE + 0x1200);
+    for (rip, already_popped) in [(0x10d0, 0), (0x10fc, 0), (0x10fe, 8), (0x10ff, 16)] {
+        let mut current = context(rip);
+        current.rsp += already_popped;
+        current.registers[4] = current.rsp;
+        let result = unwind(&mut memory, std::slice::from_ref(&module), current, 8);
+        assert!(result.complete, "{rip:#x} {}", result.stop);
+        assert_eq!(result.frames[0].method, "epilog");
+        assert_eq!(result.frames[1].rip, BASE + 0x1200);
+        assert_eq!(result.frames[1].rsp, STACK + 24);
+    }
+    put64(memory.regions.get_mut(&STACK).unwrap(), 48, BASE + 0x1200);
+    let result = unwind(&mut memory, &[module], context(0x1040), 8);
+    assert!(result.complete, "{}", result.stop);
+    assert_eq!(result.frames[0].method, "pdata");
+    assert_eq!(result.frames[1].rsp, STACK + 56);
+}
+
+#[test]
+fn version_two_epilogs_follow_chains_and_restore_machine_frames() {
+    let (mut memory, module) = unwind_fixture(&[1, 0x16, 0, 6], 0, 0);
+    let image = memory.regions.get_mut(&BASE).unwrap();
+    image[0x3100] = 2 | (4 << 3);
+    put32(image, 0x3108, 0x1300);
+    put32(image, 0x310c, 0x1400);
+    put32(image, 0x3110, 0x3200);
+    image[0x3200..0x3206].copy_from_slice(&[1, 0, 1, 0, 0, 0x1a]);
+    let stack = memory.regions.get_mut(&STACK).unwrap();
+    put64(stack, 0, BASE + 0x1200);
+    put64(stack, 8, 0x33);
+    put64(stack, 24, STACK + 0x100);
+    let result = unwind(&mut memory, &[module], context(0x10ff), 8);
+    assert!(result.complete, "{}", result.stop);
+    assert_eq!(result.frames[0].method, "epilog");
+    assert_eq!(result.frames[1].rsp, STACK + 0x100);
+}
+
+#[test]
+fn version_two_epilogs_pop_registers_across_chained_records() {
+    let (mut memory, module) = unwind_fixture(&[4, 0x16, 0, 6, 2, 0xc0], 2, 0);
+    let image = memory.regions.get_mut(&BASE).unwrap();
+    image[0x3100] = 2 | (4 << 3);
+    put32(image, 0x310c, 0x1300);
+    put32(image, 0x3110, 0x1400);
+    put32(image, 0x3114, 0x3200);
+    image[0x3200..0x320a].copy_from_slice(&[2, 1, 3, 0, 2, 0x16, 0, 6, 1, 0x30]);
+    put64(memory.regions.get_mut(&STACK).unwrap(), 16, BASE + 0x1200);
+    for (rip, already_popped) in [(0x10fc, 0), (0x10fe, 8), (0x10ff, 16)] {
+        let mut current = context(rip);
+        current.rsp += already_popped;
+        current.registers[4] = current.rsp;
+        let result = unwind(&mut memory, std::slice::from_ref(&module), current, 8);
+        assert!(result.complete, "{rip:#x} {}", result.stop);
+        assert_eq!(result.frames[0].method, "epilog");
+        assert_eq!(result.frames[1].rip, BASE + 0x1200);
+        assert_eq!(result.frames[1].rsp, STACK + 24);
+    }
+}
+
+#[test]
+fn version_two_epilogs_pop_flags_before_a_machine_frame_without_saved_registers() {
+    let (mut memory, module) = unwind_fixture(&[3, 0x16, 0, 6, 3, 2, 0, 0x1a], 3, 0);
+    memory.regions.get_mut(&BASE).unwrap()[0x3100] = 2;
+    let stack = memory.regions.get_mut(&STACK).unwrap();
+    put64(stack, 0, 0x202);
+    put64(stack, 8, BASE + 0x1200);
+    put64(stack, 16, 0x33);
+    put64(stack, 32, STACK + 0x100);
+    for (rip, already_popped) in [(0x10fd, 0), (0x10fe, 8)] {
+        let mut current = context(rip);
+        current.rsp += already_popped;
+        current.registers[4] = current.rsp;
+        let result = unwind(&mut memory, std::slice::from_ref(&module), current, 8);
+        assert!(result.complete, "{rip:#x} {}", result.stop);
+        assert_eq!(result.frames[0].method, "epilog");
+        assert_eq!(result.frames[1].rip, BASE + 0x1200);
+        assert_eq!(result.frames[1].rsp, STACK + 0x100);
+    }
+}
+
+#[test]
+fn version_two_epilogs_reject_descriptors_outside_the_function() {
+    let (mut memory, module) = unwind_fixture(&[5, 6, 4, 6], 0, 0);
+    memory.regions.get_mut(&BASE).unwrap()[0x3100] = 2;
+    let result = unwind(&mut memory, &[module], context(0x10ff), 8);
+    assert!(!result.complete);
+    assert_eq!(result.stop, "invalid version 2 epilog range");
+}
+
+#[test]
 fn unsupported_metadata_and_unmapped_stacks_return_partial_results() {
     let (mut memory, module) = unwind_fixture(&[4, 0x42], 4, 0);
     memory.regions.get_mut(&BASE).unwrap()[0x3100] = 3;
@@ -485,8 +625,8 @@ fn chained_unwind_metadata_is_applied_and_cycles_are_reported() {
     let (mut memory, module) = unwind_fixture(&[], 0, 0);
     let bytes = memory.regions.get_mut(&BASE).unwrap();
     bytes[0x3100] = 1 | (4 << 3);
-    put32(bytes, 0x3104, 0x1000);
-    put32(bytes, 0x3108, 0x1100);
+    put32(bytes, 0x3104, 0x1800);
+    put32(bytes, 0x3108, 0x1900);
     put32(bytes, 0x310c, 0x3200);
     bytes[0x3200..0x3206].copy_from_slice(&[1, 4, 1, 0, 4, 0x42]);
     put64(memory.regions.get_mut(&STACK).unwrap(), 40, BASE + 0x1200);
@@ -516,6 +656,49 @@ fn dynamic_frame_pointers_restore_saved_registers_from_the_fixed_frame_base() {
     let result = unwind(&mut memory, &[module], current, 8);
     assert!(result.complete, "{}", result.stop);
     assert_eq!(result.frames[1].rsp, STACK + 0x130);
+}
+
+#[test]
+fn chained_saves_use_the_frame_pointer_established_in_the_parent() {
+    let (mut memory, mut module) = unwind_fixture(&[4, 0xc4, 2, 0], 4, 0x15);
+    let image = memory.regions.get_mut(&BASE).unwrap();
+    image[0x3100] |= 4 << 3;
+    put32(image, 0x3108, 0x1800);
+    put32(image, 0x310c, 0x1900);
+    put32(image, 0x3110, 0x3200);
+    image[0x3200..0x320a].copy_from_slice(&[1, 4, 3, 0x15, 4, 3, 2, 0x32, 1, 0x50]);
+    module.exception_size = 24;
+    put32(image, 0x300c, 0x1200);
+    put32(image, 0x3010, 0x1300);
+    put32(image, 0x3014, 0x3300);
+    image[0x3300..0x3306].copy_from_slice(&[1, 1, 1, 0xc, 1, 3]);
+    let mut current = context(0x1020);
+    current.registers[5] = STACK + 0x110;
+    let stack = memory.regions.get_mut(&STACK).unwrap();
+    put64(stack, 0x110, STACK + 0x200);
+    put64(stack, 0x128, BASE + 0x1280);
+    let result = unwind(&mut memory, &[module], current, 8);
+    assert!(result.complete, "{}", result.stop);
+    assert_eq!(result.frames.len(), 2);
+    assert_eq!(result.frames[1].rsp, STACK + 0x130);
+}
+
+#[test]
+fn indirect_tail_epilogs_follow_the_windows_rex_w_and_bnd_rules() {
+    for (encoding, method) in [
+        (&[0xff, 0xe0][..], "pdata"),
+        (&[0x41, 0xff, 0xe2], "pdata"),
+        (&[0x49, 0xff, 0xe2], "epilog"),
+        (&[0xf2, 0x48, 0xff, 0xe0], "epilog"),
+        (&[0xf2, 0xff, 0x25, 0, 0, 0, 0], "epilog"),
+    ] {
+        let (mut memory, module) = unwind_fixture(&[4, 0x42], 4, 0);
+        memory.regions.get_mut(&BASE).unwrap()[0x1020..0x1020 + encoding.len()]
+            .copy_from_slice(encoding);
+        let result = unwind(&mut memory, &[module], context(0x1020), 8);
+        assert!(result.complete, "{}", result.stop);
+        assert_eq!(result.frames[0].method, method, "{encoding:02x?}");
+    }
 }
 
 #[test]

@@ -7,18 +7,21 @@ mod platform {
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-    };
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, NTSTATUS};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
         SetInformationJobObject, TerminateJobObject,
     };
-    use windows_sys::Win32::System::Threading::{
-        CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
-    };
+    use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        #[link_name = "NtResumeProcess"]
+        fn nt_resume_process(process: HANDLE) -> NTSTATUS;
+        #[link_name = "RtlNtStatusToDosError"]
+        fn rtl_nt_status_to_dos_error(status: NTSTATUS) -> u32;
+    }
 
     struct Handle(HANDLE);
 
@@ -60,32 +63,14 @@ mod platform {
                 if unsafe { AssignProcessToJobObject(job, child.as_raw_handle()) } == 0 {
                     return Err(io::Error::last_os_error());
                 }
-                let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-                if snapshot == INVALID_HANDLE_VALUE {
-                    return Err(io::Error::last_os_error());
+                // Child exposes the process handle, while its primary thread is still suspended.
+                let status = unsafe { nt_resume_process(child.as_raw_handle()) };
+                if status < 0 {
+                    return Err(io::Error::from_raw_os_error(unsafe {
+                        rtl_nt_status_to_dos_error(status) as i32
+                    }));
                 }
-                let snapshot = Handle(snapshot);
-                let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
-                entry.dwSize = size_of::<THREADENTRY32>() as u32;
-                let mut found = unsafe { Thread32First(snapshot.0, &mut entry) };
-                while found != 0 {
-                    if entry.th32OwnerProcessID == child.id() {
-                        let thread =
-                            unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-                        if thread.is_null() {
-                            return Err(io::Error::last_os_error());
-                        }
-                        let thread = Handle(thread);
-                        if unsafe { ResumeThread(thread.0) } == u32::MAX {
-                            return Err(io::Error::last_os_error());
-                        }
-                        return Ok(());
-                    }
-                    found = unsafe { Thread32Next(snapshot.0, &mut entry) };
-                }
-                Err(io::Error::other(
-                    "failed to find the suspended process thread",
-                ))
+                Ok(())
             })();
             if let Err(error) = setup {
                 let _ = child.kill();

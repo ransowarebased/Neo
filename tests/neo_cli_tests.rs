@@ -691,3 +691,26 @@ mod repl {
         }
     }
 }
+#[test]
+fn help_is_local_and_missing_remote_endpoint_preserves_json() {
+    let neo = env!("CARGO_BIN_EXE_neo");
+    for arguments in [["read", "--help"], ["modules", "-h"]] {
+        let result = std::process::Command::new(neo)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{:?}", result.stderr);
+        assert!(String::from_utf8_lossy(&result.stdout).contains("neo read"));
+    }
+    let result = std::process::Command::new(neo)
+        .args(["--remote", "--json", "read"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(result.stderr.is_empty());
+    let envelope: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        envelope["error"]["message"],
+        "--remote requires ADDRESS:PORT"
+    );
+}

@@ -8,8 +8,9 @@ thread_local! {
     static ERROR_CODE: Cell<Option<(&'static str, bool)>> = const { Cell::new(None) };
 }
 
-pub fn begin(arguments: &mut Vec<String>) {
+pub fn begin(arguments: &mut Vec<String>) -> bool {
     let mut enabled = false;
+    let mut help = false;
     let mut index = 0;
     let mut command_seen = false;
     while index < arguments.len() {
@@ -19,10 +20,20 @@ pub fn begin(arguments: &mut Vec<String>) {
         if arguments[index] == "--json" {
             arguments.remove(index);
             enabled = true;
+        } else if matches!(arguments[index].as_str(), "--help" | "-h") {
+            help = true;
+            index += 1;
+        } else if arguments[index] == "--remote" {
+            index += 1;
+            if arguments
+                .get(index)
+                .is_some_and(|value| !value.starts_with('-'))
+            {
+                index += 1;
+            }
         } else if matches!(
             arguments[index].as_str(),
-            "--remote"
-                | "--timeout"
+            "--timeout"
                 | "--exec-timeout-ms"
                 | "--listen"
                 | "--cleanup"
@@ -63,6 +74,7 @@ pub fn begin(arguments: &mut Vec<String>) {
     JSON.set(enabled);
     EMITTED.set(false);
     ERROR_CODE.set(None);
+    help
 }
 
 pub fn is_json() -> bool {

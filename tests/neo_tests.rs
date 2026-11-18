@@ -135,6 +135,24 @@ mod transport {
         }
     }
 
+    #[test]
+    fn road_preserves_all_windows_process_status_bits() {
+        for kind in [RequestKind::Exec, RequestKind::ExecStream] {
+            for exit_code in [None, Some(i32::MIN), Some(-1), Some(0)] {
+                let response = Response {
+                    exit_code,
+                    ..Response::failure(kind, "process finished")
+                };
+                let mut frame = Vec::new();
+                write_response(&mut frame, 42, &response).unwrap();
+                assert_eq!(
+                    read_response(&mut frame.as_slice()).unwrap(),
+                    (42, response)
+                );
+            }
+        }
+    }
+
     fn header(kind: u16, payload_size: u32) -> Vec<u8> {
         let mut frame = b"ROAD".to_vec();
         frame.extend_from_slice(&crate::server::protocol::PROTOCOL_VERSION.to_le_bytes());
@@ -165,6 +183,37 @@ mod transport {
                 Err(ProtocolError::InvalidKind(value)) if value == kind
             ));
         }
+    }
+
+    #[test]
+    fn update_frames_read_in_chunks_and_validate_the_binary_length_first() {
+        struct BoundedRead<'a>(&'a [u8]);
+        impl Read for BoundedRead<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                assert!(buffer.len() <= 8192);
+                self.0.read(buffer)
+            }
+        }
+
+        let request = Request::Update {
+            binary: vec![0xa5; 24 * 1024],
+        };
+        let mut frame = Vec::new();
+        write_request(&mut frame, 42, &request).unwrap();
+        assert_eq!(
+            read_request(&mut BoundedRead(&frame)).unwrap(),
+            (42, request)
+        );
+        frame[20..24].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(matches!(
+            read_request(&mut BoundedRead(&frame[..24])),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+        let oversized = header(RequestKind::Exec as u16, MAX_FRAME_SIZE as u32);
+        assert!(matches!(
+            read_request(&mut BoundedRead(&oversized)),
+            Err(ProtocolError::FrameTooLarge(_))
+        ));
     }
 
     #[test]

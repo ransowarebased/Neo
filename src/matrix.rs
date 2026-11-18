@@ -11,7 +11,7 @@ pub enum Command {
 pub(crate) mod windows {
     use super::Command;
     use crate::server::protocol::{RequestKind, Response, read_response, write_response};
-    use crate::update::{self, Abi, Package, Phase};
+    use matrixhv_sdk::update::{self, Abi, Package, Phase};
     use neo::protocol::{
         CONTROL_MAGIC, CONTROL_PROBE_OPERATION, CONTROL_VERSION, ControlProbeSnapshot,
         ControlRequest, ControlStatus,

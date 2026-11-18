@@ -388,6 +388,10 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "matrixhv-sdk"
 version = "1.0.0"
+dependencies = [
+ "ed25519-dalek",
+ "sha2",
+]
 
 [[package]]
 name = "memchr"
@@ -410,7 +414,6 @@ name = "neo"
 version = "1.0.0"
 dependencies = [
  "colored",
- "ed25519-dalek",
  "libc",
  "matrixhv-sdk",
  "pdb",

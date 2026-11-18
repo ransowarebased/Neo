@@ -70,7 +70,7 @@ fn save_root_hint(path: &Path, identity: [u64; 4], root: u64) -> std::io::Result
     for (value, encoded) in identity
         .into_iter()
         .chain([root])
-        .zip(bytes[8..].chunks_exact_mut(8))
+        .zip(bytes[8..].as_chunks_mut::<8>().0)
     {
         encoded.copy_from_slice(&value.to_le_bytes());
     }
@@ -170,6 +170,11 @@ fn matches_process_image(
     check(root, peb, process_name, name_truncated, read).is_some()
 }
 
+pub(crate) fn normalized_root(cr3: u64) -> Option<u64> {
+    let root = cr3 & !4095;
+    (root != 0 && root & !0x000f_ffff_ffff_f000 == 0).then_some(root)
+}
+
 pub(crate) fn matched_root_with(
     candidates: &[u64],
     peb: u64,
@@ -178,12 +183,12 @@ pub(crate) fn matched_root_with(
     read: &mut impl FnMut(u64, u64, usize) -> Option<Vec<u8>>,
 ) -> Option<u64> {
     for (index, candidate) in candidates.iter().enumerate() {
-        let root = candidate & !4095;
-        if root == 0
-            || root & !0x000f_ffff_ffff_f000 != 0
-            || candidates[..index]
-                .iter()
-                .any(|previous| previous & !4095 == root)
+        let Some(root) = normalized_root(*candidate) else {
+            continue;
+        };
+        if candidates[..index]
+            .iter()
+            .any(|previous| previous & !4095 == root)
         {
             continue;
         }
@@ -258,40 +263,37 @@ pub fn resolve_process(
     roots.retain(|root| *root & !4095 != 0);
     roots.sort_unstable();
     roots.dedup();
-    let mut process = symbols.resolve(selector, 0, &roots, quad(&info, 56))?;
+    let syscall = quad(&info, 56);
+    let mut process = symbols.resolve(selector, target_cr3, &roots, syscall)?;
     let reported_root = process.user_root();
-    let requested_root = target_cr3 & !4095;
-    let native_peb = !process.wow64 && process.peb != 0;
-    let reported_is_unusable = reported_root & !0x000f_ffff_ffff_ffff != 0 || reported_root == 0;
-    let requested_is_distinct = target_cr3 != 0
-        && requested_root != process.kernel_cr3
-        && requested_root != process.user_cr3;
-    let requested_is_unusable = target_cr3 != 0 && target_cr3 & !0x000f_ffff_ffff_ffff != 0;
-    if process.kernel_cr3 & !0x000f_ffff_ffff_ffff != 0 || process.kernel_cr3 == 0 {
+    if normalized_root(process.kernel_cr3).is_none() {
         process.kernel_access_cr3 = process.observed_kernel_cr3;
     }
-    if native_peb || reported_is_unusable || requested_is_distinct || requested_is_unusable {
-        if !native_peb {
+    if process.wow64 || process.peb == 0 {
+        if target_cr3 != 0 {
+            // The process list already verified the requested root against EPROCESS.
+            process.validated_user_cr3 = normalized_root(target_cr3);
+        } else if normalized_root(reported_root).is_none() {
             return Err(
                 "cannot validate an alternate root without a native 64-bit process PEB".into(),
             );
         }
-        let root = if target_cr3 != 0 {
-            matched_root(&[target_cr3], &process).ok_or_else(|| {
-                format!("CR3 {target_cr3:#x} does not map the target PEB and image")
-            })?
-        } else {
-            let mut candidates = vec![reported_root, process.user_cr3, process.kernel_cr3];
-            candidates.extend(cached_process_root(process.root_identity()));
-            candidates.extend_from_slice(&roots);
-            matched_root(&candidates, &process)
-                .map(Ok)
-                .unwrap_or_else(|| observed_user_root(&process, &candidates))?
-        };
-        process.validated_user_cr3 = Some(root);
-        process.kernel_access_cr3 = process.observed_kernel_cr3;
-        cache_process_root(&process);
+        return Ok(process);
     }
+    let root = if target_cr3 != 0 {
+        matched_root(&[target_cr3], &process)
+            .ok_or_else(|| format!("CR3 {target_cr3:#x} does not map the target PEB and image"))?
+    } else {
+        let mut candidates = vec![reported_root, process.user_cr3, process.kernel_cr3];
+        candidates.extend(cached_process_root(process.root_identity()));
+        candidates.extend_from_slice(&roots);
+        matched_root(&candidates, &process)
+            .map(Ok)
+            .unwrap_or_else(|| observed_user_root(&process, &candidates))?
+    };
+    process.validated_user_cr3 = Some(root);
+    process.kernel_access_cr3 = process.observed_kernel_cr3;
+    cache_process_root(&process);
     Ok(process)
 }
 

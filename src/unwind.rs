@@ -190,11 +190,12 @@ fn epilog(
                         target < module.base + u64::from(function.begin)
                             || target >= module.base + u64::from(function.end)
                     });
-                    let opcode_offset = offset + usize::from(bytes[offset] & 0xf0 == 0x40);
-                    let indirect_tail = bytes.get(opcode_offset) == Some(&0xff)
-                        && bytes
-                            .get(opcode_offset + 1)
-                            .is_some_and(|modrm| modrm & 0xf8 == 0x20);
+                    let start = offset + usize::from(bytes[offset] == 0xf2);
+                    let indirect_tail = match bytes.get(start..offset + length) {
+                        Some([0xff, 0x25, ..]) => true,
+                        Some([rex, 0xff, modrm, ..]) => rex & 0xf8 == 0x48 && modrm & 0x38 == 0x20,
+                        _ => false,
+                    };
                     if !direct_tail && !indirect_tail {
                         return Ok(None);
                     }
@@ -250,27 +251,46 @@ fn epilog(
     Ok(None)
 }
 
-fn unwind_codes(
+struct FunctionUnwind {
+    epilog: bool,
+    machine_frame: bool,
+}
+
+fn unwind_function(
     reader: &mut impl MemoryReader,
     module: &Module,
     mut function: RuntimeFunction,
     context: &mut UnwindContext,
     control_pc: u64,
-    lower: u64,
-    upper: u64,
-) -> Result<bool, String> {
+    bounds: (u64, u64),
+    check_epilog: bool,
+) -> Result<FunctionUnwind, String> {
+    let (lower, upper) = bounds;
     let mut visited = HashSet::new();
     let mut machine_frame = false;
-    for _ in 0..16 {
+    let mut frame_base = context.rsp;
+    let mut frame_layout = 0;
+    let mut epilog_offset = None;
+    for depth in 0..16 {
         if !visited.insert(function.unwind) {
             return Err("cyclic chained unwind metadata".into());
         }
-        let header = read_exact(reader, module.address(function.unwind, 4)?, 4)?;
-        if header[0] & 7 != 1 {
-            return Err(format!(
-                "unsupported unwind metadata version {}",
-                header[0] & 7
-            ));
+        let header = read_exact(reader, module.address(function.unwind, 4)?, 4);
+        if depth == 0
+            && check_epilog
+            && header.as_ref().map_or(true, |header| header[0] & 7 == 1)
+            && let Some(caller) = epilog(reader, module, function, context, lower, upper)?
+        {
+            *context = caller;
+            return Ok(FunctionUnwind {
+                epilog: true,
+                machine_frame: false,
+            });
+        }
+        let header = header?;
+        let version = header[0] & 7;
+        if !matches!(version, 1 | 2) {
+            return Err(format!("unsupported unwind metadata version {version}"));
         }
         let flags = header[0] >> 3;
         let count = header[2] as usize;
@@ -292,32 +312,61 @@ fn unwind_codes(
                 0
             };
         let bytes = read_exact(reader, module.address(function.unwind, size)?, size)?;
-        let position = control_pc.saturating_sub(module.base + u64::from(function.begin));
+        let mut first_slot = 0;
+        if version == 2 {
+            let pc = (depth == 0 && check_epilog).then_some((control_pc - module.base) as u32);
+            let (descriptor_slots, offset) =
+                epilog_v2_descriptors(&bytes[4..4 + count * 2], function, pc)?;
+            first_slot = descriptor_slots;
+            if depth == 0 {
+                epilog_offset = offset;
+            }
+        }
+        if let Some(offset) = &mut epilog_offset {
+            let codes = &bytes[4 + first_slot * 2..4 + count * 2];
+            let machine_frame = unwind_v2_epilog(reader, context, codes, offset, bounds)?;
+            if machine_frame || flags & 4 == 0 {
+                if !machine_frame {
+                    context.rip = stack_word(reader, context.rsp, lower, upper)?;
+                    add_rsp(context, 8)?;
+                }
+                return Ok(FunctionUnwind {
+                    epilog: true,
+                    machine_frame,
+                });
+            }
+            function = runtime_function(&bytes, 4 + (count * 2).div_ceil(4) * 4, module)?;
+            continue;
+        }
+        // A secondary fragment has already run every ancestor's prolog.
+        let position = if depth == 0 {
+            control_pc.saturating_sub(module.base + u64::from(function.begin))
+        } else {
+            u64::from(header[1])
+        };
         let in_prolog = position < u64::from(header[1]);
-        let mut frame_base = context.rsp;
-        if frame_register != 0 {
-            let mut code_slot = 0;
-            while code_slot < count {
-                let offset = 4 + code_slot * 2;
-                let operation = bytes[offset + 1] & 15;
-                let info = bytes[offset + 1] >> 4;
-                if operation == 3 && (!in_prolog || u64::from(bytes[offset]) <= position) {
+        if depth == 0 {
+            frame_layout = header[3];
+            if frame_register != 0 {
+                let mut established = !in_prolog || flags & 4 != 0;
+                let mut code_slot = first_slot;
+                while !established && code_slot < count {
+                    let offset = 4 + code_slot * 2;
+                    let operation = bytes[offset + 1] & 15;
+                    let info = bytes[offset + 1] >> 4;
+                    established = operation == 3 && u64::from(bytes[offset]) <= position;
+                    code_slot += unwind_slots(operation, info)?;
+                }
+                if established {
                     frame_base = context.registers[frame_register]
                         .checked_sub(frame_offset)
                         .ok_or("frame base underflow")?;
-                    break;
                 }
-                code_slot += match operation {
-                    0 | 2 | 3 | 10 => 1,
-                    1 if info == 0 => 2,
-                    1 if info == 1 => 3,
-                    4 | 8 => 2,
-                    5 | 9 => 3,
-                    _ => return Err("unsupported unwind operation".into()),
-                };
             }
+        } else if header[3] != frame_layout {
+            return Err("inconsistent chained unwind frame register or offset".into());
         }
-        let mut slot = 0;
+        let mut slot = first_slot;
         let mut previous_offset = u8::MAX;
         while slot < count {
             let offset = 4 + slot * 2;
@@ -328,22 +377,15 @@ fn unwind_codes(
                 return Err("invalid unwind code ordering".into());
             }
             previous_offset = code_offset;
-            let slots = match operation {
-                0 | 2 | 3 | 10 => 1,
-                1 if info == 0 => 2,
-                1 if info == 1 => 3,
-                4 | 8 => 2,
-                5 | 9 => 3,
-                _ => return Err("unsupported unwind operation".into()),
-            };
+            let slots = unwind_slots(operation, info as u8)?;
             if slot + slots > count {
                 return Err("truncated unwind operation operands".into());
             }
             if !in_prolog || u64::from(code_offset) <= position {
                 match operation {
                     0 => {
-                        if !nonvolatile(info) {
-                            return Err("invalid saved nonvolatile register".into());
+                        if info == 4 || version == 1 && !nonvolatile(info) {
+                            return Err("invalid saved register".into());
                         }
                         context.registers[info] = stack_word(reader, context.rsp, lower, upper)?;
                         add_rsp(context, 8)?;
@@ -361,9 +403,7 @@ fn unwind_codes(
                         if frame_register == 0 || info != 0 {
                             return Err("invalid unwind frame register".into());
                         }
-                        context.rsp = context.registers[frame_register]
-                            .checked_sub(frame_offset)
-                            .ok_or("frame register underflow")?;
+                        context.rsp = frame_base;
                         context.registers[4] = context.rsp;
                     }
                     4 | 5 => {
@@ -386,28 +426,7 @@ fn unwind_codes(
                         if info > 1 || machine_frame {
                             return Err("invalid machine frame unwind".into());
                         }
-                        let base = context
-                            .rsp
-                            .checked_add(if info == 1 { 8 } else { 0 })
-                            .ok_or("machine frame overflow")?;
-                        if stack_word(
-                            reader,
-                            base.checked_add(8).ok_or("machine frame overflow")?,
-                            lower,
-                            upper,
-                        )? & 3
-                            != 3
-                        {
-                            return Err("machine frame crosses the user-mode boundary".into());
-                        }
-                        context.rip = stack_word(reader, base, lower, upper)?;
-                        context.rsp = stack_word(
-                            reader,
-                            base.checked_add(24).ok_or("machine frame overflow")?,
-                            lower,
-                            upper,
-                        )?;
-                        context.registers[4] = context.rsp;
+                        restore_machine_frame(reader, context, info == 1, bounds)?;
                         machine_frame = true;
                     }
                     _ => return Err("unsupported unwind operation".into()),
@@ -416,11 +435,153 @@ fn unwind_codes(
             slot += slots;
         }
         if flags & 4 == 0 {
-            return Ok(machine_frame);
+            if !machine_frame {
+                context.rip = stack_word(reader, context.rsp, lower, upper)?;
+                add_rsp(context, 8)?;
+            }
+            return Ok(FunctionUnwind {
+                epilog: false,
+                machine_frame,
+            });
         }
         function = runtime_function(&bytes, 4 + (count * 2).div_ceil(4) * 4, module)?;
     }
     Err("chained unwind metadata exceeds its depth limit".into())
+}
+
+fn epilog_v2_descriptors(
+    codes: &[u8],
+    function: RuntimeFunction,
+    pc: Option<u32>,
+) -> Result<(usize, Option<u32>), String> {
+    const UWOP_EPILOG: u8 = 6;
+    let count = codes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .take_while(|code| code[1] & 15 == UWOP_EPILOG)
+        .count();
+    if count == 0 {
+        return Ok((0, None));
+    }
+    let size = u32::from(codes[0]);
+    let at_end = codes[1] >> 4;
+    if size == 0 || at_end > 1 || at_end == 0 && count < 2 {
+        return Err("invalid version 2 epilog header".into());
+    }
+    let mut position = None;
+    let mut epilogs = 0;
+    let mut padding = false;
+    let implicit = (at_end == 1).then_some(size);
+    for distance in implicit.into_iter().chain(
+        codes[2..2 * count]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|code| u32::from(code[0]) | (u32::from(code[1] >> 4) << 8)),
+    ) {
+        if distance == 0 {
+            padding = true;
+            continue;
+        }
+        if padding || distance < size || distance > function.end - function.begin {
+            return Err("invalid version 2 epilog range".into());
+        }
+        epilogs += 1;
+        let start = function.end - distance;
+        if let Some(pc) = pc.filter(|pc| (start..start + size).contains(pc)) {
+            position = Some(pc - start);
+        }
+    }
+    if epilogs == 0 {
+        return Err("version 2 epilog table has no entries".into());
+    }
+    Ok((count, position))
+}
+
+fn unwind_v2_epilog(
+    reader: &mut impl MemoryReader,
+    context: &mut UnwindContext,
+    mut codes: &[u8],
+    offset: &mut u32,
+    bounds: (u64, u64),
+) -> Result<bool, String> {
+    // The epilog starts after stack deallocation. Only the pops and final
+    // return remain, in the order encoded by the reversed prolog operations.
+    while let Some([_, operation]) = codes.first_chunk::<2>() {
+        if matches!(operation & 15, 0 | 10) || matches!(codes, [_, 2, _, 0x0a | 0x1a]) {
+            break;
+        }
+        let bytes = 2 * unwind_slots(operation & 15, operation >> 4)?;
+        codes = codes
+            .get(bytes..)
+            .ok_or("truncated unwind operation operands")?;
+    }
+    let (lower, upper) = bounds;
+    // Carry the remaining instruction offset into the next chained record.
+    while let Some([_, operation]) = codes.first_chunk::<2>() {
+        if operation & 15 != 0 {
+            break;
+        }
+        let register = (operation >> 4) as usize;
+        // V2 metadata also describes pushes of volatile registers used by Windows stubs.
+        if register == 4 {
+            return Err("invalid epilog pop register".into());
+        }
+        if *offset == 0 {
+            context.registers[register] = stack_word(reader, context.rsp, lower, upper)?;
+            add_rsp(context, 8)?;
+        }
+        *offset = offset.saturating_sub(if register < 8 { 1 } else { 2 });
+        codes = &codes[2..];
+    }
+    // A trailing eight-byte allocation denotes the slot saved by PUSHFQ.
+    if let [_, 2, rest @ ..] = codes {
+        if *offset == 0 {
+            add_rsp(context, 8)?;
+        }
+        *offset = offset.saturating_sub(1);
+        codes = rest;
+    }
+    match codes {
+        [] => Ok(false),
+        [_, 0x0a | 0x1a] => {
+            restore_machine_frame(reader, context, false, bounds)?;
+            Ok(true)
+        }
+        _ => Err("invalid version 2 epilog operations".into()),
+    }
+}
+
+fn restore_machine_frame(
+    reader: &mut impl MemoryReader,
+    context: &mut UnwindContext,
+    skip_error_code: bool,
+    (lower, upper): (u64, u64),
+) -> Result<(), String> {
+    let base = context
+        .rsp
+        .checked_add(u64::from(skip_error_code) * 8)
+        .ok_or("machine frame overflow")?;
+    let stack_slot = |offset| base.checked_add(offset).ok_or("machine frame overflow");
+    if stack_word(reader, stack_slot(8)?, lower, upper)? & 3 != 3 {
+        return Err("machine frame crosses the user-mode boundary".into());
+    }
+    context.rip = stack_word(reader, base, lower, upper)?;
+    context.rsp = stack_word(reader, stack_slot(24)?, lower, upper)?;
+    context.registers[4] = context.rsp;
+    Ok(())
+}
+
+fn unwind_slots(operation: u8, info: u8) -> Result<usize, String> {
+    match operation {
+        0 | 2 | 3 | 10 => Ok(1),
+        1 if info == 0 => Ok(2),
+        1 if info == 1 => Ok(3),
+        4 | 8 => Ok(2),
+        5 | 9 => Ok(3),
+        _ => Err("unsupported unwind operation".into()),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -635,7 +796,8 @@ pub fn unwind_with_tables(
     let lower = context.rsp;
     let upper = lower.saturating_add(1024 * 1024).min(0x8000_0000_0000);
     let mut visited = HashSet::new();
-    for index in 0..maximum {
+    let mut exact_pc = true;
+    for _ in 0..maximum {
         if context.rip == 0 {
             result.complete = true;
             result.stop = "end_of_stack".into();
@@ -652,7 +814,7 @@ pub fn unwind_with_tables(
             method: String::new(),
         });
         let step = (|| -> Result<&str, String> {
-            let control_pc = context.rip.saturating_sub(u64::from(index != 0));
+            let control_pc = context.rip - u64::from(!exact_pc);
             let static_image = modules.iter().find(|module| module.contains(control_pc));
             let mut function = None;
             if let Some(module) = static_image {
@@ -690,28 +852,25 @@ pub fn unwind_with_tables(
                 "frame is outside loaded modules and has no available dynamic function entry",
             )?;
             let previous_rsp = context.rsp;
+            let check_epilog = exact_pc;
+            exact_pc = false;
             let method = if let Some(function) = function {
-                if let Some(caller) = epilog(reader, module, function, &context, lower, upper)? {
-                    context = caller;
+                let unwound = unwind_function(
+                    reader,
+                    module,
+                    function,
+                    &mut context,
+                    control_pc,
+                    (lower, upper),
+                    check_epilog,
+                )?;
+                exact_pc = unwound.machine_frame;
+                if unwound.epilog {
                     "epilog"
+                } else if dynamic_image.is_some() {
+                    "dynamic_pdata"
                 } else {
-                    if !unwind_codes(
-                        reader,
-                        module,
-                        function,
-                        &mut context,
-                        control_pc,
-                        lower,
-                        upper,
-                    )? {
-                        context.rip = stack_word(reader, context.rsp, lower, upper)?;
-                        add_rsp(&mut context, 8)?;
-                    }
-                    if dynamic_image.is_some() {
-                        "dynamic_pdata"
-                    } else {
-                        "pdata"
-                    }
+                    "pdata"
                 }
             } else {
                 if !module.sections.iter().any(|section| {

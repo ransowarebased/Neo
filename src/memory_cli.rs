@@ -1021,12 +1021,26 @@ pub(crate) fn dump_tracking(
             } else {
                 String::new()
             };
-            writeln!(manifest,
-                "{{\"index\":{},\"cr3\":{},\"gva\":{},\"initial_gpa\":{},\"current_gpa\":{},\"pte_fingerprint\":{},\"current_fingerprint\":{},\"flags\":{},\"status\":{},\"hash_changed\":{},\"initial_sha256\":\"{}\",\"sha256\":\"{}\",\"dump\":\"{}\"}}",
-                first + index, quad(record, 0), quad(record, 8), quad(record, 16), quad(record, 24),
-                quad(record, 32), quad(record, 40), flags, status, flags & TRACK_HASH_CHANGED != 0,
-                hex_bytes(&record[56..88]), hex_bytes(&record[88..120]), filename)
-                .map_err(|error| error.to_string())?;
+            writeln!(
+                manifest,
+                "{}",
+                json!({
+                    "index": page_index,
+                    "cr3": output::hex(quad(record, 0)),
+                    "gva": output::hex(quad(record, 8)),
+                    "initial_gpa": output::hex(quad(record, 16)),
+                    "current_gpa": output::hex(quad(record, 24)),
+                    "pte_fingerprint": output::hex(quad(record, 32)),
+                    "current_fingerprint": output::hex(quad(record, 40)),
+                    "flags": flags,
+                    "status": status,
+                    "hash_changed": flags & TRACK_HASH_CHANGED != 0,
+                    "initial_sha256": hex_bytes(&record[56..88]),
+                    "sha256": hex_bytes(&record[88..120]),
+                    "dump": filename,
+                })
+            )
+            .map_err(|error| error.to_string())?;
         }
         first += count;
     }

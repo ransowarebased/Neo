@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const DEFAULT_LISTEN_ADDRESS: &str = "0.0.0.0:4040";
+pub const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:4040";
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) const MAX_CAPTURED_STREAM_SIZE: usize = 16 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 8;
@@ -645,6 +645,16 @@ pub mod protocol {
     pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 290_000;
     pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
     const MAX_COMMAND_ARGUMENTS: usize = 4096;
+    // Allow the UTF-8 expansion and length fields of a Win32 command line.
+    const MAX_EXEC_REQUEST_BYTES: usize = if cfg!(windows) {
+        256 * 1024
+    } else {
+        8 * 1024 * 1024
+    };
+    const FRAME_READ_CHUNK: usize = 8192;
+    const RESPONSE_FAILURE: u32 = 1;
+    // Only escape the ambiguous value, keeping ordinary ROAD v2 frames compatible.
+    const RESPONSE_MIN_EXIT_CODE: u32 = 2;
     const HEADER_SIZE: usize = 20;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -818,6 +828,7 @@ pub mod protocol {
             }
             Request::Update { binary } => encoded_size(0, [binary.len()])?,
         };
+        validate_request_size(request.kind(), payload_size)?;
         let mut payload = Vec::with_capacity(payload_size);
         match request {
             Request::Ping | Request::Status => {}
@@ -849,8 +860,22 @@ pub mod protocol {
     }
 
     pub fn read_request(reader: &mut impl Read) -> Result<(u64, Request), ProtocolError> {
-        let (raw_kind, request_id, payload) = read_frame(reader, false)?;
+        let (raw_kind, request_id, payload_size) = read_header(reader)?;
         let kind = RequestKind::try_from(raw_kind)?;
+        validate_request_size(kind, payload_size)?;
+        if kind == RequestKind::Update {
+            let mut length = [0; 4];
+            reader.read_exact(&mut length)?;
+            let length = u32::from_le_bytes(length) as usize;
+            if length != payload_size - 4 {
+                return Err(ProtocolError::InvalidPayload(
+                    "invalid update payload length",
+                ));
+            }
+            let binary = read_payload(reader, length)?;
+            return Ok((request_id, Request::Update { binary }));
+        }
+        let payload = read_payload(reader, payload_size)?;
         let mut cursor = Cursor::new(&payload);
         let request = match kind {
             RequestKind::Ping => Request::Ping,
@@ -890,9 +915,7 @@ pub mod protocol {
                     }
                 }
             }
-            RequestKind::Update => Request::Update {
-                binary: cursor.read_bytes()?.to_vec(),
-            },
+            RequestKind::Update => unreachable!("update payload is read directly"),
             RequestKind::Telemetry => {
                 if payload.is_empty() {
                     Request::Telemetry {
@@ -925,7 +948,23 @@ pub mod protocol {
             ],
         )?;
         let mut payload = Vec::with_capacity(payload_size);
-        put_u32(&mut payload, u32::from(!response.success));
+        let mut flags = if response.success {
+            0
+        } else {
+            RESPONSE_FAILURE
+        };
+        if response.exit_code == Some(i32::MIN) {
+            if !matches!(
+                response.request_kind,
+                RequestKind::Exec | RequestKind::ExecStream
+            ) {
+                return Err(ProtocolError::InvalidPayload(
+                    "unexpected process exit code",
+                ));
+            }
+            flags |= RESPONSE_MIN_EXIT_CODE;
+        }
+        put_u32(&mut payload, flags);
         put_i32(&mut payload, response.exit_code.unwrap_or(i32::MIN));
         put_bytes(&mut payload, response.message.as_bytes())?;
         put_bytes(&mut payload, &response.stdout)?;
@@ -939,18 +978,28 @@ pub mod protocol {
     }
 
     pub fn read_response(reader: &mut impl Read) -> Result<(u64, Response), ProtocolError> {
-        let (raw_kind, request_id, payload) = read_frame(reader, true)?;
+        let (raw_kind, request_id, payload_size) = read_header(reader)?;
         if raw_kind & 0x8000 == 0 {
             return Err(ProtocolError::InvalidResponseKind(raw_kind));
         }
         let request_kind = RequestKind::try_from(raw_kind & 0x7fff)?;
+        if payload_size < 20 {
+            return Err(ProtocolError::TruncatedPayload);
+        }
+        let payload = read_payload(reader, payload_size)?;
         let mut cursor = Cursor::new(&payload);
-        let success = match cursor.read_u32()? {
-            0 => true,
-            1 => false,
-            _ => return Err(ProtocolError::InvalidPayload("invalid response status")),
-        };
+        let flags = cursor.read_u32()?;
+        if flags & !(RESPONSE_FAILURE | RESPONSE_MIN_EXIT_CODE) != 0 {
+            return Err(ProtocolError::InvalidPayload("invalid response status"));
+        }
         let raw_exit_code = cursor.read_i32()?;
+        let has_min_exit_code = flags & RESPONSE_MIN_EXIT_CODE != 0;
+        if has_min_exit_code
+            && (raw_exit_code != i32::MIN
+                || !matches!(request_kind, RequestKind::Exec | RequestKind::ExecStream))
+        {
+            return Err(ProtocolError::InvalidPayload("inconsistent exit code flag"));
+        }
         let message = String::from_utf8(cursor.read_bytes()?.to_vec())
             .map_err(|_| ProtocolError::InvalidUtf8)?;
         let stdout = cursor.read_bytes()?.to_vec();
@@ -960,8 +1009,9 @@ pub mod protocol {
             request_id,
             Response {
                 request_kind,
-                success,
-                exit_code: (raw_exit_code != i32::MIN).then_some(raw_exit_code),
+                success: flags & RESPONSE_FAILURE == 0,
+                exit_code: (has_min_exit_code || raw_exit_code != i32::MIN)
+                    .then_some(raw_exit_code),
                 message,
                 stdout,
                 stderr,
@@ -992,10 +1042,7 @@ pub mod protocol {
         Ok(())
     }
 
-    fn read_frame(
-        reader: &mut impl Read,
-        response: bool,
-    ) -> Result<(u16, u64, Vec<u8>), ProtocolError> {
+    fn read_header(reader: &mut impl Read) -> Result<(u16, u64, usize), ProtocolError> {
         let mut header = [0u8; HEADER_SIZE];
         reader.read_exact(&mut header)?;
         if header[0..4] != MAGIC {
@@ -1010,31 +1057,42 @@ pub mod protocol {
         if payload_size > MAX_FRAME_SIZE {
             return Err(ProtocolError::FrameTooLarge(payload_size));
         }
-        if response {
-            if kind & 0x8000 == 0 {
-                return Err(ProtocolError::InvalidResponseKind(kind));
-            }
-            RequestKind::try_from(kind & 0x7fff)?;
-            if payload_size < 20 {
-                return Err(ProtocolError::TruncatedPayload);
-            }
-        } else {
-            let valid_size = match RequestKind::try_from(kind)? {
-                RequestKind::Ping | RequestKind::Status => payload_size == 0,
-                RequestKind::Exec | RequestKind::ExecStream => payload_size >= 8,
-                RequestKind::Update => payload_size >= 4,
-                RequestKind::Telemetry => matches!(payload_size, 0 | 8),
-            };
-            if !valid_size {
-                return Err(ProtocolError::InvalidPayload(
-                    "invalid request payload size",
-                ));
-            }
-        }
         let request_id = u64::from_le_bytes(header[12..20].try_into().unwrap());
-        let mut payload = vec![0u8; payload_size];
-        reader.read_exact(&mut payload)?;
-        Ok((kind, request_id, payload))
+        Ok((kind, request_id, payload_size))
+    }
+
+    fn validate_request_size(kind: RequestKind, size: usize) -> Result<(), ProtocolError> {
+        let valid = match kind {
+            RequestKind::Ping | RequestKind::Status => size == 0,
+            RequestKind::Exec | RequestKind::ExecStream => {
+                if size > MAX_EXEC_REQUEST_BYTES {
+                    return Err(ProtocolError::FrameTooLarge(size));
+                }
+                size >= 8
+            }
+            RequestKind::Update => (4..=MAX_FRAME_SIZE).contains(&size),
+            RequestKind::Telemetry => matches!(size, 0 | 8),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(ProtocolError::InvalidPayload(
+                "invalid request payload size",
+            ))
+        }
+    }
+
+    fn read_payload(reader: &mut impl Read, size: usize) -> Result<Vec<u8>, ProtocolError> {
+        // A header alone never reserves the advertised size. Grow as bytes arrive.
+        let mut payload = Vec::new();
+        let mut chunk = [0; FRAME_READ_CHUNK];
+        while payload.len() < size {
+            let length = (size - payload.len()).min(chunk.len());
+            reader.read_exact(&mut chunk[..length])?;
+            payload.try_reserve(length).map_err(io::Error::other)?;
+            payload.extend_from_slice(&chunk[..length]);
+        }
+        Ok(payload)
     }
 
     fn put_u32(buffer: &mut Vec<u8>, value: u32) {

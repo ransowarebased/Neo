@@ -92,6 +92,7 @@ fn full_vad_walk_sorts_regions_and_detects_cycles_and_overlaps() {
 }
 
 const KERNEL_ROOT: u64 = 0x1000;
+const LIST_HEAD: u64 = 0xffff_8000_0000_0400;
 const FIRST_PROCESS: u64 = 0xffff_8000_0000_1000;
 const PROCESS_PEB: u64 = 0x20000;
 
@@ -117,6 +118,7 @@ impl ResolutionFixture {
                 image_bytes: 0,
             },
             initial_process: 0,
+            active_process_head: None,
             syscall_rvas: Vec::new(),
             process_bytes: 88,
             pid_offset: 0,
@@ -133,20 +135,38 @@ impl ResolutionFixture {
             soft_layout: SoftPteLayout::default(),
         };
         let mut rows = BTreeMap::new();
+        let process_link =
+            |index: usize| FIRST_PROCESS + index as u64 * 0x1000 + symbols.links_offset as u64;
+        let head = if processes.is_empty() {
+            [LIST_HEAD; 2]
+        } else {
+            [process_link(0), process_link(processes.len() - 1)]
+        };
+        rows.insert(
+            (KERNEL_ROOT, LIST_HEAD),
+            head.into_iter().flat_map(u64::to_le_bytes).collect(),
+        );
         let mut roots = vec![KERNEL_ROOT];
         for (index, (pid, name)) in processes.iter().enumerate() {
             let object = FIRST_PROCESS + index as u64 * 0x1000;
-            let next = FIRST_PROCESS + ((index + 1) % processes.len()) as u64 * 0x1000;
-            let previous =
-                FIRST_PROCESS + ((index + processes.len() - 1) % processes.len()) as u64 * 0x1000;
+            let next = if index + 1 == processes.len() {
+                LIST_HEAD
+            } else {
+                process_link(index + 1)
+            };
+            let previous = if index == 0 {
+                LIST_HEAD
+            } else {
+                process_link(index - 1)
+            };
             let root = (index as u64 + 2) * 0x1000;
             roots.push(root);
             let mut row = vec![0; symbols.process_bytes];
             for (offset, value) in [
                 (0, *pid),
                 (8, *pid + 100),
-                (24, next + symbols.links_offset as u64),
-                (32, previous + symbols.links_offset as u64),
+                (24, next),
+                (32, previous),
                 (56, root),
                 (64, root),
                 (72, PROCESS_PEB),
@@ -202,7 +222,7 @@ impl ResolutionFixture {
             selector,
             target_cr3,
             KERNEL_ROOT,
-            FIRST_PROCESS,
+            LIST_HEAD,
             &self.roots,
             &mut |root, address, length| {
                 let ((stored_root, base), bytes) = self
@@ -288,6 +308,66 @@ fn duplicate_full_names_still_require_a_pid() {
             .unwrap()
             .contains("multiple processes")
     );
+    assert_eq!(fixture.resolve_with_root(name, 0x3007).unwrap().pid, 42);
+}
+
+#[test]
+fn explicit_root_selects_its_owner_when_a_homonym_shares_the_same_peb_address() {
+    let name = "ExampleClient-Win64-Shipping.exe";
+    let mut fixture = ResolutionFixture::new(&[(41, name), (42, name)]);
+    fixture.rows.remove(&(0x2000, PROCESS_PEB));
+    let process = fixture.resolve_with_root(name, 0x3007).unwrap();
+    assert_eq!(process.pid, 42);
+    assert_eq!(process.user_root(), 0x3000);
+}
+
+#[test]
+fn explicit_root_checks_both_directories_without_a_native_peb() {
+    let mut fixture = ResolutionFixture::new(&[(41, "example.exe"), (42, "example.exe")]);
+    fixture.rows.get_mut(&(KERNEL_ROOT, FIRST_PROCESS)).unwrap()[64..72]
+        .copy_from_slice(&0x4000u64.to_le_bytes());
+    for (peb, wow64) in [(PROCESS_PEB, 1u64), (0, 0)] {
+        let row = fixture.rows.get_mut(&(KERNEL_ROOT, FIRST_PROCESS)).unwrap();
+        row[72..80].copy_from_slice(&peb.to_le_bytes());
+        row[80..88].copy_from_slice(&wow64.to_le_bytes());
+        let error = fixture.resolve_with_root("41", 0x3007).err().unwrap();
+        assert!(
+            error.starts_with("CR3 does not belong to pid=41"),
+            "{error}"
+        );
+        for root in [0x2007, 0x4007] {
+            assert_eq!(fixture.resolve_with_root("41", root).unwrap().pid, 41);
+        }
+    }
+    for root in [7, 0x4000_0000_0000_2007] {
+        let error = fixture.resolve_with_root("41", root).err().unwrap();
+        assert_eq!(error, format!("invalid process CR3 {root:#x}"));
+    }
+}
+
+#[test]
+fn terminated_objects_and_the_list_head_are_excluded_from_process_selection() {
+    let mut fixture = ResolutionFixture::new(&[(41, "similar.exe"), (42, "similar.exe")]);
+    fixture.rows.get_mut(&(KERNEL_ROOT, FIRST_PROCESS)).unwrap()[16..24]
+        .copy_from_slice(&1u64.to_le_bytes());
+    assert_eq!(fixture.resolve("similar.exe").unwrap().pid, 42);
+    for selector in ["0", "41", "missing.exe"] {
+        assert!(
+            fixture
+                .resolve(selector)
+                .err()
+                .unwrap()
+                .contains("was not found")
+        );
+    }
+}
+
+#[test]
+fn pdb_extensions_are_case_insensitive() {
+    let mut rsds = b"RSDS".to_vec();
+    rsds.extend([0; 20]);
+    rsds.extend(b"C:\\Symbols\\Example.PDB\0");
+    assert_eq!(Identity::parse(&rsds).unwrap().name, "Example.PDB");
 }
 
 #[test]
