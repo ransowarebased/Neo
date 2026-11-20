@@ -3,10 +3,13 @@ use neo::protocol::memory::{
     EPT_SYNC_DIAGNOSTIC_WORDS, INTERCEPT_DIAGNOSTIC_WORDS, INTERCEPT_RUNTIME_PHASES,
 };
 use neo::protocol::{
-    MATRIXHV_EXIT_TIMING_CAPABILITY, MATRIXHV_EXIT_TIMING_SUBLEAF, MATRIXHV_STATUS_LEAF,
-    MATRIXHV_STATUS_PROTOCOL, MATRIXHV_STATUS_SIGNATURE_EAX, MATRIXHV_STATUS_SIGNATURE_EBX,
-    MATRIXHV_STATUS_SIGNATURE_ECX, MATRIXHV_VMCALL_SNAPSHOT_CAPABILITY,
-    MATRIXHV_VMCALL_SNAPSHOT_SUBLEAF, MATRIXHV_VMCALL_SNAPSHOT_WORDS,
+    MATRIXHV_EPT_REVALIDATION_CAPABILITY, MATRIXHV_EPT_REVALIDATION_SUBLEAF,
+    MATRIXHV_EXIT_TIMING_CAPABILITY, MATRIXHV_EXIT_TIMING_SUBLEAF,
+    MATRIXHV_L2_WRMSR_PROFILE_CAPABILITY, MATRIXHV_L2_WRMSR_PROFILE_SUBLEAF,
+    MATRIXHV_L2_WRMSR_PROFILE_WORDS, MATRIXHV_STATUS_LEAF, MATRIXHV_STATUS_PROTOCOL,
+    MATRIXHV_STATUS_SIGNATURE_EAX, MATRIXHV_STATUS_SIGNATURE_EBX, MATRIXHV_STATUS_SIGNATURE_ECX,
+    MATRIXHV_VMCALL_SNAPSHOT_CAPABILITY, MATRIXHV_VMCALL_SNAPSHOT_SUBLEAF,
+    MATRIXHV_VMCALL_SNAPSHOT_WORDS,
 };
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -14,6 +17,92 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MATRIXHV_DIAGNOSTIC_MIN_PROTOCOL: u32 = 4;
+
+pub(crate) fn append_l2_wrmsr_profile(
+    text: &mut String,
+    prefix: &str,
+    mut read: impl FnMut(u32) -> (u64, u64),
+) {
+    const NAMES: [&str; MATRIXHV_L2_WRMSR_PROFILE_WORDS] = [
+        "total",
+        "x2apic",
+        "hyperv_apic",
+        "hyperv_other",
+        "spec_ctrl",
+        "other",
+        "x2apic_tpr",
+        "x2apic_eoi",
+        "x2apic_icr",
+        "x2apic_self_ipi",
+        "hyperv_eoi",
+        "hyperv_icr",
+        "hyperv_tpr",
+        "last_ecx",
+    ];
+    let mut words = [0_u64; MATRIXHV_L2_WRMSR_PROFILE_WORDS];
+    for (index, values) in words.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+        let (first, second) = read(MATRIXHV_L2_WRMSR_PROFILE_SUBLEAF + index as u32);
+        *values = [first, second];
+    }
+    writeln!(
+        text,
+        "{prefix}.nested_l2_wrmsr.scope=observed_l2_reason_32_exits"
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "{prefix}.nested_l2_wrmsr.hyperv_range=0x40000000..0x40001fff"
+    )
+    .unwrap();
+    for (index, name) in NAMES.iter().enumerate() {
+        writeln!(text, "{prefix}.nested_l2_wrmsr.{name}={}", words[index]).unwrap();
+    }
+    for (index, name) in NAMES.iter().enumerate().take(6).skip(1) {
+        if words[0] == 0 {
+            writeln!(text, "{prefix}.nested_l2_wrmsr.{name}_pct=unavailable").unwrap();
+        } else {
+            writeln!(
+                text,
+                "{prefix}.nested_l2_wrmsr.{name}_pct={:.6}",
+                words[index] as f64 * 100.0 / words[0] as f64
+            )
+            .unwrap();
+        }
+    }
+    let (requested, merged) =
+        read(MATRIXHV_L2_WRMSR_PROFILE_SUBLEAF + (MATRIXHV_L2_WRMSR_PROFILE_WORDS / 2) as u32);
+    writeln!(text, "{prefix}.nested_secondary_requested=0x{requested:x}").unwrap();
+    writeln!(text, "{prefix}.nested_secondary_merged=0x{merged:x}").unwrap();
+    writeln!(
+        text,
+        "{prefix}.nested_x2apic_requested={}",
+        requested & (1 << 4) != 0
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "{prefix}.nested_x2apic_active={}",
+        merged & (1 << 4) != 0
+    )
+    .unwrap();
+    for (name, bit) in [
+        ("apic_register_virtualization", 8),
+        ("virtual_interrupt_delivery", 9),
+    ] {
+        writeln!(
+            text,
+            "{prefix}.nested_{name}_requested={}",
+            requested & (1 << bit) != 0
+        )
+        .unwrap();
+        writeln!(
+            text,
+            "{prefix}.nested_{name}_active={}",
+            merged & (1 << bit) != 0
+        )
+        .unwrap();
+    }
+}
 const TELEMETRY_CONTROL_CAPABILITY: u32 = 1 << 8;
 const EXIT_PROFILE_CAPABILITY: u32 = 1 << 10;
 const EXIT_REASON_COUNTS_CAPABILITY: u32 = 1 << 11;
@@ -141,6 +230,27 @@ pub(crate) fn append_ept_diagnostics(
         for (name, value) in names[index * 2..index * 2 + 2].iter().zip([first, second]) {
             writeln!(output, "{prefix}.ept_sync.stall.{name}=0x{value:016x}").unwrap();
         }
+    }
+}
+
+pub(crate) fn append_memory_diagnostic(
+    output: &mut String,
+    prefix: &str,
+    mut read: impl FnMut(u32) -> (u64, u64),
+) {
+    let base = neo::protocol::MATRIXHV_L2_MEMORY_DIAGNOSTIC_SUBLEAF;
+    let (sequence, phase) = read(base);
+    let (address, entry) = read(base + 1);
+    let (level, status) = read(base + 2);
+    let after = read(base);
+    let stable = sequence & 1 == 0 && after == (sequence, phase);
+    writeln!(
+        output,
+        "{prefix}.memory_diag.consistent={stable}\n{prefix}.memory_diag.sequence={sequence}"
+    )
+    .unwrap();
+    if stable && sequence != 0 {
+        writeln!(output, "{prefix}.memory_diag.phase={phase}\n{prefix}.memory_diag.address=0x{address:x}\n{prefix}.memory_diag.entry=0x{entry:x}\n{prefix}.memory_diag.level={level}\n{prefix}.memory_diag.status={status}").unwrap();
     }
 }
 
@@ -1034,6 +1144,29 @@ mod vmcall_snapshot_tests {
     use super::*;
 
     #[test]
+    fn l2_wrmsr_profile_reports_exclusive_shares_and_actual_nested_controls() {
+        let mut text = String::new();
+        let words = [100, 30, 20, 10, 25, 15, 1, 2, 3, 4, 5, 6, 7, 0x48];
+        append_l2_wrmsr_profile(&mut text, "cpu.2", |subleaf| {
+            let index = (subleaf - MATRIXHV_L2_WRMSR_PROFILE_SUBLEAF) as usize * 2;
+            if index == words.len() {
+                (0x12, 0x92)
+            } else {
+                (words[index], words[index + 1])
+            }
+        });
+        assert!(text.contains("cpu.2.nested_l2_wrmsr.x2apic_pct=30.000000\n"));
+        assert!(text.contains("cpu.2.nested_l2_wrmsr.spec_ctrl_pct=25.000000\n"));
+        assert!(text.contains("cpu.2.nested_l2_wrmsr.hyperv_eoi=5\n"));
+        assert!(text.contains("cpu.2.nested_x2apic_active=true\n"));
+        assert!(text.contains("cpu.2.nested_virtual_interrupt_delivery_active=false\n"));
+        text.clear();
+        append_l2_wrmsr_profile(&mut text, "cpu.2", |_| (0, 0));
+        assert!(text.contains("cpu.2.nested_l2_wrmsr.x2apic_pct=unavailable\n"));
+        assert!(text.contains("cpu.2.nested_x2apic_active=false\n"));
+    }
+
+    #[test]
     fn coherent_snapshots_expose_inputs_and_the_guest_exception_response() {
         let mut words = [0_u64; MATRIXHV_VMCALL_SNAPSHOT_WORDS];
         words[0] = 2;
@@ -1551,6 +1684,11 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
             let caps = diagnostic_cpu(34, cpu);
             writeln!(sample, "{prefix}.processor_number={}", caps.ebx).unwrap();
             writeln!(sample, "{prefix}.capabilities=0x{:x}", caps.eax).unwrap();
+            if caps.eax & neo::protocol::MATRIXHV_L2_MEMORY_DIAGNOSTIC_CAPABILITY != 0 {
+                append_memory_diagnostic(&mut sample, &prefix, |leaf| {
+                    pair(diagnostic_cpu(leaf, cpu))
+                });
+            }
             writeln!(sample, "{prefix}.watchdog_active={}", caps.ecx).unwrap();
             if caps.eax & CONTROL_STAGE_CAPABILITY != 0 {
                 let (stage, phase) = pair(diagnostic_cpu(50, cpu));
@@ -1627,6 +1765,27 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
                     let (first, second) = pair(diagnostic_cpu(0x300 + index, cpu));
                     writeln!(sample, "{prefix}.exit_reason.{}={first}", index * 2).unwrap();
                     writeln!(sample, "{prefix}.exit_reason.{}={second}", index * 2 + 1).unwrap();
+                }
+            }
+            if caps.eax & MATRIXHV_L2_WRMSR_PROFILE_CAPABILITY != 0 && mode == Mode::General {
+                append_l2_wrmsr_profile(&mut sample, &prefix, |subleaf| {
+                    pair(diagnostic_cpu(subleaf, cpu))
+                });
+            }
+            if caps.eax & MATRIXHV_EPT_REVALIDATION_CAPABILITY != 0 && mode == Mode::General {
+                for (index, names) in [
+                    ["calls", "budget_exhaustions"],
+                    ["leaves_checked", "leaves_dropped_at_budget"],
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let (first, second) = pair(diagnostic_cpu(
+                        MATRIXHV_EPT_REVALIDATION_SUBLEAF + index as u32,
+                        cpu,
+                    ));
+                    writeln!(sample, "{prefix}.ept_revalidation.{}={first}", names[0]).unwrap();
+                    writeln!(sample, "{prefix}.ept_revalidation.{}={second}", names[1]).unwrap();
                 }
             }
             if mode != Mode::EptDiagnostics {
@@ -1739,8 +1898,13 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
                 neo::protocol::MATRIXHV_INTEL_PT_RING_CAPABILITY,
             ),
             ("exit_timing", MATRIXHV_EXIT_TIMING_CAPABILITY),
+            ("l2_wrmsr_profile", MATRIXHV_L2_WRMSR_PROFILE_CAPABILITY),
             ("ept_diagnostics", EPT_DIAGNOSTIC_CAPABILITY),
             ("ept_recycling", EPT_RECYCLING_CAPABILITY),
+            (
+                "l2_memory_diagnostics",
+                neo::protocol::MATRIXHV_L2_MEMORY_DIAGNOSTIC_CAPABILITY,
+            ),
             ("control_trace", CONTROL_STAGE_CAPABILITY),
             (
                 "control_native_snapshot",
@@ -1781,23 +1945,65 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
     "capabilities=none\nlogical_processor_count=unavailable\nvmcs_shadowing_host_supported=unknown\nvmcs_shadowing_query=requires_matrixhv_msr_telemetry\n".to_string()
 }
 
+pub(crate) fn resident_session_status(matrixhv_present: bool, protocol: u32) -> String {
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    if matrixhv_present && protocol >= MATRIXHV_DIAGNOSTIC_MIN_PROTOCOL {
+        if diagnostic(34).eax & neo::protocol::MATRIXHV_RESIDENT_SESSION_CAPABILITY != 0 {
+            let state = diagnostic(neo::protocol::MATRIXHV_RESIDENT_SESSION_SUBLEAF);
+            return format!(
+                "resident_session_query=supported\nresident_session_scope=l0_interception_allocation\nresident_session_consistency=independent_atomic_fields\nresident_session_present={}\nresident_session_state={}\nresident_session_cause={}\nl2_session_inventory=unsupported\nl2_profile_inventory=unsupported\n",
+                state.eax != 0,
+                state.ebx,
+                state.ecx
+            );
+        }
+    }
+    let _ = (matrixhv_present, protocol);
+    "resident_session_query=unsupported_by_resident_core\nresident_session_scope=l0_interception_allocation\nl2_session_inventory=unsupported\nl2_profile_inventory=unsupported\n".into()
+}
+
 fn format_vmx_support(
     host_secondary: u64,
     nested_secondary: u64,
     host_misc: u64,
     nested_misc: u64,
 ) -> String {
-    format!(
+    let mut text = format!(
         "vmx_capability_source=matrixhv_root_msr_snapshot\nvmx_host_secondary_controls=0x{host_secondary:x}\nvmx_nested_secondary_controls=0x{nested_secondary:x}\nvmcs_shadowing_host_supported={}\nvmcs_shadowing_nested_exposed={}\nvmx_host_vmwrite_read_only_supported={}\nvmx_nested_vmwrite_read_only_supported={}\n",
         host_secondary & (1 << 46) != 0,
         nested_secondary & (1 << 46) != 0,
         host_misc & (1 << 29) != 0,
         nested_misc & (1 << 29) != 0,
+    );
+    writeln!(
+        text,
+        "x2apic_virtualization_host_supported={}",
+        host_secondary & (1 << 36) != 0
     )
+    .unwrap();
+    writeln!(
+        text,
+        "x2apic_virtualization_nested_exposed={}",
+        nested_secondary & (1 << 36) != 0
+    )
+    .unwrap();
+    text
 }
 
 #[cfg(test)]
 mod vmx_support_tests {
+    #[test]
+    fn x2apic_support_uses_the_allowed_one_half_of_the_capability_msr() {
+        let text = super::format_vmx_support(1 << 36, 1 << 4, 0, 0);
+        assert!(text.contains("x2apic_virtualization_host_supported=true\n"));
+        assert!(text.contains("x2apic_virtualization_nested_exposed=false\n"));
+        let text = super::format_vmx_support(1 << 4, 1 << 36, 0, 0);
+        assert!(text.contains("x2apic_virtualization_host_supported=false\n"));
+        assert!(text.contains("x2apic_virtualization_nested_exposed=true\n"));
+    }
     #[test]
     fn shadowing_uses_the_allowed_one_bit_and_reports_nested_filtering() {
         let text = super::format_vmx_support(1 << 46, 1 << 14, 1 << 29, 0);

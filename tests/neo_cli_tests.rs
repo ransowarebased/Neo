@@ -46,6 +46,15 @@ fn json_cli_preserves_envelopes_for_local_remote_memory_and_timeouts() {
     assert_eq!(status["data"]["exec_timeout"], true);
     assert!(status["data"]["matrixhv_present"].is_boolean());
     assert!(status["data"]["matrixhv_protocol"].is_number());
+    assert_eq!(
+        status["data"]["remote_memory_commands_scope"],
+        "command_routing_only"
+    );
+    assert_eq!(
+        status["data"]["memory_transport_scope"],
+        "current_cpu_caller_level"
+    );
+    assert_eq!(status["data"]["l2_session_inventory"], "unsupported");
     assert!(status["data"].get("memory_tsc_offset").is_none());
     assert_eq!(
         status["data"]["binary_fingerprint"].as_str().unwrap().len(),

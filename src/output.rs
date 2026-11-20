@@ -167,7 +167,7 @@ pub fn classify(message: &str) -> (&'static str, bool) {
     if let Some(error) = ERROR_CODE.get() {
         return error;
     }
-    for status in 1..=15 {
+    for status in 1..=16 {
         if message.ends_with(neo::memory::status_text(status)) {
             return memory_status(status);
         }
@@ -177,9 +177,9 @@ pub fn classify(message: &str) -> (&'static str, bool) {
         ("EXEC_TIMEOUT", false)
     } else if lower.contains("timed out") || lower.contains("timeout expired") {
         ("CONNECTION_TIMEOUT", false)
-    } else if lower.contains("memory transport is unavailable")
-        || lower.contains("matrixhv is not present")
-    {
+    } else if lower.contains("memory transport is unavailable") {
+        ("MEMORY_TRANSPORT_UNAVAILABLE", false)
+    } else if lower.contains("matrixhv is not present") {
         ("HYPERVISOR_INACTIVE", false)
     } else if lower.starts_with("process ") && lower.contains("was not found") {
         ("PROCESS_NOT_FOUND", false)
@@ -230,6 +230,7 @@ pub fn memory_status(status: u32) -> (&'static str, bool) {
         13 => ("MAPPING_CHANGED", false),
         14 => ("WRITE_COMMITTED_MERGE_CONFLICT", false),
         15 => ("WRITE_COMMITTED_REFRESH_FAILED", false),
+        16 => ("WRITE_COMMITTED_RESPONSE_LOST", false),
         _ => ("COMMAND_FAILED", false),
     }
 }
@@ -256,5 +257,29 @@ pub fn finish(exit_code: i32) -> Result<(), String> {
         }
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_transport_does_not_claim_l0_is_absent() {
+        clear_error();
+        assert_eq!(
+            classify(
+                "MatrixHV memory transport is unavailable from L2; L0 diagnostics remain available"
+            ),
+            ("MEMORY_TRANSPORT_UNAVAILABLE", false)
+        );
+        assert_eq!(
+            classify("MatrixHV is not present on this CPU"),
+            ("HYPERVISOR_INACTIVE", false)
+        );
+        assert_eq!(
+            classify("MatrixHV off unsupported while nested virtualization is active"),
+            ("UNSUPPORTED_FEATURE", false)
+        );
     }
 }

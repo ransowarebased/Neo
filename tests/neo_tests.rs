@@ -1124,3 +1124,29 @@ mod exit_benchmark {
         }
     }
 }
+#[test]
+fn nested_memory_diagnostics_reject_active_or_torn_snapshots() {
+    use crate::telemetry::append_memory_diagnostic;
+    let base = crate::protocol::MATRIXHV_L2_MEMORY_DIAGNOSTIC_SUBLEAF;
+    for stable in [true, false] {
+        let mut text = String::new();
+        let mut calls = 0;
+        append_memory_diagnostic(&mut text, "cpu.0", |leaf| {
+            calls += 1;
+            match leaf - base {
+                0 if !stable && calls == 4 => (4, 4),
+                0 => (2, 4),
+                1 => (0x1000, 0x8000_0000_1234_0007),
+                2 => (39, 1),
+                _ => unreachable!(),
+            }
+        });
+        assert!(text.contains(&format!("memory_diag.consistent={stable}")));
+        assert_eq!(text.contains("memory_diag.entry="), stable);
+        if stable { assert!(text.contains("memory_diag.status=1")); }
+    }
+    let mut text = String::new();
+    append_memory_diagnostic(&mut text, "cpu.0", |_| (3, 2));
+    assert!(text.contains("memory_diag.consistent=false"));
+    assert!(!text.contains("memory_diag.entry="));
+}

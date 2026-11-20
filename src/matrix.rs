@@ -7,6 +7,32 @@ pub enum Command {
     Update(std::path::PathBuf),
 }
 
+pub fn status_fields(report: &str) -> serde_json::Value {
+    let mut lines = String::new();
+    if let Some(first) = report.lines().next() {
+        for field in first
+            .split_whitespace()
+            .take_while(|field| !field.starts_with("probe_errors="))
+        {
+            if field.contains('=') {
+                lines.push_str(field);
+                lines.push('\n');
+            }
+        }
+    }
+    for line in report
+        .lines()
+        .skip(1)
+        .filter(|line| !line.starts_with("update "))
+    {
+        lines.push_str(line);
+        lines.push('\n');
+    }
+    let mut data = crate::output::fields(&lines);
+    data["report"] = serde_json::json!(report);
+    data
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) mod windows {
     use super::Command;
@@ -1013,6 +1039,7 @@ pub(crate) mod windows {
         reference: &ControlStatus,
         progress: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
+        matrixhv_sdk::runtime::query().transition_preflight("update", reference.active_mask)?;
         if reference.capabilities & 4 == 0
             || reference.active_mask != reference.expected_mask
             || reference.stopped_mask != 0
@@ -1184,6 +1211,20 @@ pub(crate) mod windows {
                 .map(|(index, apic_id)| format!("{index}:{apic_id}"))
                 .collect::<Vec<_>>()
                 .join(",");
+            let runtime = matrixhv_sdk::runtime::query();
+            let coverage =
+                if observed_mask == status.expected_mask && probe_mask == status.active_mask {
+                    "complete"
+                } else {
+                    "partial"
+                };
+            let probe_support = if runtime.nested_mask != 0 || runtime.l2_mask != 0 {
+                "unsupported_nested"
+            } else if probe_mask == status.active_mask {
+                "verified"
+            } else {
+                "unverified"
+            };
             return Ok(format!(
                 "bridge=present capabilities={:#x} apic_id={} processors={} expected={:#x} observed={:#x} vmexit_probe={:#x} active={:#x} stopped={:#x} failed={:#x} exit_boot_services={} virtual_address_change={} cpu_map={} routes={} probe_errors={} probe_snapshots={}\n{}\n",
                 status.capabilities,
@@ -1202,6 +1243,9 @@ pub(crate) mod windows {
                 probe_errors,
                 probe_snapshots,
                 update_summary(&status),
+            ) + &format!(
+                "status_coverage={coverage}\nvmexit_probe_support={probe_support}\ncapabilities_scope=advertised_bridge_operations\nnested_mask={:#x}\nl2_mask={:#x}\n",
+                runtime.nested_mask, runtime.l2_mask
             ));
         }
         let operation = match command {
@@ -1237,6 +1281,7 @@ pub(crate) mod windows {
             _ => status.expected_mask,
         };
         if operation == 2 {
+            matrixhv_sdk::runtime::query().transition_preflight("off", status.active_mask)?;
             let (observed_mask, _, probe_mask, probe_errors, _) = observe_processors(&status)?;
             if observed_mask != status.expected_mask || probe_mask != status.active_mask {
                 return Err(format!(

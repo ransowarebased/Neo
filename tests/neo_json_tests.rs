@@ -164,7 +164,7 @@ fn error_codes_preserve_retry_and_committed_write_semantics() {
     for (message, expected) in [
         (
             "MatrixHV memory transport is unavailable; boot the updated EFI",
-            ("HYPERVISOR_INACTIVE", false),
+            ("MEMORY_TRANSPORT_UNAVAILABLE", false),
         ),
         ("MatrixHV is not present", ("HYPERVISOR_INACTIVE", false)),
         ("process 123 was not found", ("PROCESS_NOT_FOUND", false)),
@@ -384,4 +384,16 @@ fn execution_deadline_kills_descendants_even_after_the_parent_exits() {
         #[cfg(not(target_os = "windows"))]
         assert!(pid != 0);
     }
+}
+#[test]
+fn matrix_partial_status_preserves_masks_and_full_diagnostics() {
+    let report = "bridge=present capabilities=0x7 expected=0xffff observed=0xffff vmexit_probe=0x0 active=0xffff probe_errors=runtime probe failed with Win32 error 50\nupdate phase=0\nstatus_coverage=partial\nvmexit_probe_support=unsupported_nested\n";
+    let value = crate::matrix::status_fields(report);
+    assert_eq!(value["bridge"], "present");
+    assert_eq!(value["expected"], "0x000000000000ffff");
+    assert_eq!(value["active"], "0x000000000000ffff");
+    assert_eq!(value["vmexit_probe"], "0x0000000000000000");
+    assert_eq!(value["status_coverage"], "partial");
+    assert_eq!(value["vmexit_probe_support"], "unsupported_nested");
+    assert_eq!(value["report"], report);
 }

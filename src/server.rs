@@ -228,8 +228,17 @@ pub fn status_text() -> String {
         text.push_str(&format!("executable_path={}\n", executable.display()));
     }
     text.push_str(
-        "road_protocol=2\nexec_timeout=true\nexec_stream=true\nremote_memory_commands=true\n",
+        "road_protocol=2\nexec_timeout=true\nexec_stream=true\nremote_memory_commands=true\nremote_memory_commands_scope=command_routing_only\ncapabilities_scope=advertised_features_not_operational_proof\nmemory_transport_scope=current_cpu_caller_level\n",
     );
+    let runtime = matrixhv_sdk::runtime::query();
+    text.push_str(&format!("diagnostic_transport={}\nnested_state_scope=l0_resident_cpu_slots\nnested_state_available={}\nnested_mask={:#x}\nl2_mask={:#x}\ncaller_level={}\n",
+        runtime.present, runtime.diagnostic_available, runtime.nested_mask, runtime.l2_mask,
+        if !runtime.diagnostic_available { "unknown" } else if runtime.caller_l2 { "l2" } else { "l1" }));
+    text.push_str(&format!("l2_memory_advertised={}\n", runtime.l2_memory_advertised));
+    text.push_str(&crate::telemetry::resident_session_status(
+        status.matrixhv_present,
+        status.matrixhv_protocol,
+    ));
     text.push_str(&crate::telemetry::capability_status(
         status.matrixhv_present,
         status.matrixhv_protocol,
@@ -244,6 +253,15 @@ pub fn status_text() -> String {
         if let Ok(mut packet) = info_packet() {
             if invoke(&mut packet).is_ok() {
                 let flags = word(&packet, 72);
+                if flags & neo::protocol::memory::L2_MEMORY_CAPABILITY != 0 {
+                    text.push_str("memory_address_space=l2_current_ept12\nmemory_operations=info_read_write\n");
+                    if flags & neo::protocol::memory::L2_KERNEL_ROOT_CAPABILITY != 0 {
+                        text.push_str(&format!("memory_kernel_root_discovery=scoped_l2_observations\nmemory_kernel_root_ready={}\nmemory_kernel_root_validation=executable_lstar_then_client_kernel_identity\n",
+                            neo::protocol::memory::quad(&packet, 64) != 0));
+                    } else {
+                        text.push_str("memory_kernel_root_discovery=explicit_root_required\n");
+                    }
+                }
                 text.push_str(&format!(
                     "memory_transport=true\nmemory_capabilities=0x{flags:x}\n"
                 ));
@@ -260,11 +278,15 @@ pub fn status_text() -> String {
                     text.push_str(&format!("{name}={}\n", flags & flag != 0));
                 }
             } else {
-                text.push_str("memory_transport=false\n");
+                text.push_str(if runtime.caller_l2 && !runtime.l2_memory_advertised {
+                    "memory_transport=false\nmemory_transport_reason=l2_unsupported\n"
+                } else {
+                    "memory_transport=false\nmemory_transport_reason=unavailable_on_current_cpu\n"
+                });
             }
         }
     } else {
-        text.push_str("memory_transport=false\n");
+        text.push_str("memory_transport=false\nmemory_transport_reason=matrixhv_absent\n");
     }
     text
 }

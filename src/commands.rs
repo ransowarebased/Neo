@@ -103,7 +103,15 @@ pub fn run(mut arguments: Vec<String>) -> Result<i32, String> {
     if output::is_json()
         && matches!(
             &options.action,
-            Action::Shell | Action::Serve | Action::ApplyUpdate(_) | Action::Matrix(_)
+            Action::Shell
+                | Action::Serve
+                | Action::ApplyUpdate(_)
+                | Action::Matrix(
+                    matrix::Command::On
+                        | matrix::Command::Off
+                        | matrix::Command::OffProcessor(_)
+                        | matrix::Command::Update(_)
+                )
         )
     {
         return Err("--json requires a noninteractive status, ping, telemetry, PT, memory, startup, update, or exec command".into());
@@ -316,7 +324,12 @@ fn run_local(action: Action, listen_address: &str) -> Result<i32, String> {
                 println!("MatrixHV activation cancelled.");
                 return Ok(0);
             }
-            print!("{}", matrix::execute(command)?);
+            let report = matrix::execute(command)?;
+            if output::is_json() {
+                output::success(matrix::status_fields(&report))?;
+            } else {
+                print!("{report}");
+            }
             Ok(0)
         }
         Action::Serve => {

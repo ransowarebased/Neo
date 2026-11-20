@@ -1,6 +1,9 @@
 #[cfg(test)]
 #[path = "../../MatrixHV/src/memory/access.rs"]
 pub(crate) mod access;
+#[cfg(test)]
+#[path = "../../MatrixHV/src/memory/nested.rs"]
+pub(crate) mod nested;
 
 #[cfg(test)]
 #[path = "../../MatrixHV/src/memory/tracking.rs"]
